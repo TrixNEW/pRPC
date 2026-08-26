@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package data;
+
+service DataService {
+    rpc GetPlayer(GetPlayerRequest) returns (GetPlayerResponse);
+    rpc SavePlayer(SavePlayerRequest) returns (SavePlayerResponse);
+}
+
+message GetPlayerRequest {
+    string xuid = 1;
+}
+
+message GetPlayerResponse {
+    string xuid = 1;
+    string name = 2;
+    int64 coins = 3;
+}
+
+message SavePlayerRequest {
+    string xuid = 1;
+    string name = 2;
+    int64 coins = 3;
+}
+
+message SavePlayerResponse {
+    bool success = 1;
+}
