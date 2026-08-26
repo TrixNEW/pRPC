@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Trix\pRPC;
 
+use Closure;
 use Throwable;
 
 /**
@@ -14,8 +15,9 @@ final class RpcPromiseResolver{
     /** @var RpcPromise<TValue> */
     private RpcPromise $promise;
 
-    public function __construct(){
-        $this->promise = new RpcPromise();
+    /** @param Closure(Throwable): void $callbackErrorHandler */
+    public function __construct(Closure $callbackErrorHandler){
+        $this->promise = new RpcPromise($callbackErrorHandler);
     }
 
     /** @return RpcPromise<TValue> */

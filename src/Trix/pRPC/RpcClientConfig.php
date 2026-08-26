@@ -4,38 +4,48 @@ declare(strict_types=1);
 
 namespace Trix\pRPC;
 
-use Grpc\BaseStub;
 use InvalidArgumentException;
 
 final readonly class RpcClientConfig{
     public RpcCredentials $credentials;
 
+    /** @var list<RpcMethod> */
+    public array $methods;
+
     /** @var array<string, mixed> */
     public array $channelOptions;
 
     /**
-     * @param class-string<BaseStub> $stubClass
-     * @param array<string, mixed> $channelOptions Only scalar/null/nested-array values are allowed.
+     * @param list<RpcMethod> $methods
+     * @param array<string, mixed> $channelOptions Scalar/null/nested-array values only.
      */
     public function __construct(
         public string $endpoint,
-        public string $stubClass,
+        array $methods,
         ?RpcCredentials $credentials = null,
         array $channelOptions = [],
         public int $workers = 2,
-        public int $defaultTimeoutMs = 3_000,
-        public int $maxTimeoutMs = 30_000,
-        public int $maxPending = 8_192,
-        public int $batchSize = 32
+        public int $batchSize = 4,
+        public int $defaultTimeoutMs = 1_500,
+        public int $maxTimeoutMs = 5_000,
+        public int $maxOutstanding = 4_096,
+        public int $maxRequestBytes = 4_194_304,
+        public int $maxResponseBytes = 4_194_304,
+        public int $maxMetadataBytes = 32_768,
+        public int $reconnectBackoffMinMs = 100,
+        public int $reconnectBackoffMaxMs = 5_000
     ){
         if($endpoint === ''){
             throw new InvalidArgumentException('endpoint cannot be empty.');
         }
-        if(!is_a($stubClass, BaseStub::class, true)){
-            throw new InvalidArgumentException("{$stubClass} must extend " . BaseStub::class . '.');
+        if($methods === []){
+            throw new InvalidArgumentException('At least one RpcMethod must be registered.');
         }
         if($workers < 1 || $workers > 16){
             throw new InvalidArgumentException('workers must be between 1 and 16.');
+        }
+        if($batchSize < 1 || $batchSize > 64){
+            throw new InvalidArgumentException('batchSize must be between 1 and 64.');
         }
         if($defaultTimeoutMs <= 0){
             throw new InvalidArgumentException('defaultTimeoutMs must be greater than 0.');
@@ -43,19 +53,38 @@ final readonly class RpcClientConfig{
         if($maxTimeoutMs < $defaultTimeoutMs){
             throw new InvalidArgumentException('maxTimeoutMs must be >= defaultTimeoutMs.');
         }
-        if($maxPending < 1){
-            throw new InvalidArgumentException('maxPending must be greater than 0.');
+        if($maxOutstanding < 1){
+            throw new InvalidArgumentException('maxOutstanding must be greater than 0.');
         }
-        if($batchSize < 1 || $batchSize > 1_024){
-            throw new InvalidArgumentException('batchSize must be between 1 and 1024.');
+        if($maxRequestBytes < 1 || $maxResponseBytes < 1 || $maxMetadataBytes < 1){
+            throw new InvalidArgumentException('Message and metadata byte limits must be greater than 0.');
+        }
+        if($reconnectBackoffMinMs < 1 || $reconnectBackoffMaxMs < $reconnectBackoffMinMs){
+            throw new InvalidArgumentException('Invalid reconnect backoff range.');
         }
         if(array_key_exists('credentials', $channelOptions)){
             throw new InvalidArgumentException("Do not put 'credentials' in channelOptions; use RpcCredentials instead.");
         }
 
+        $normalizedMethods = [];
+        $seenPaths = [];
+        foreach($methods as $method){
+            if(!$method instanceof RpcMethod){
+                throw new InvalidArgumentException('methods must contain only RpcMethod instances.');
+            }
+            if(isset($seenPaths[$method->path])){
+                throw new InvalidArgumentException("Duplicate RPC method path '$method->path'.");
+            }
+            $seenPaths[$method->path] = true;
+            $normalizedMethods[] = $method;
+        }
+
         self::validateThreadSafeValue($channelOptions, 'channelOptions');
+        $channelOptions['grpc.max_send_message_length'] ??= $maxRequestBytes;
+        $channelOptions['grpc.max_receive_message_length'] ??= $maxResponseBytes;
 
         $this->credentials = $credentials ?? RpcCredentials::insecure();
+        $this->methods = $normalizedMethods;
         $this->channelOptions = $channelOptions;
     }
 

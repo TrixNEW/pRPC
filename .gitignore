@@ -9,3 +9,4 @@ nbproject/*
 
 # Composer
 vendor/*
+composer.lock

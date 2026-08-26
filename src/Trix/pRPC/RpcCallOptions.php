@@ -12,7 +12,9 @@ final readonly class RpcCallOptions{
     /** @var array<string, list<string>> */
     public array $metadata;
 
-    /** @param array<string, string|list<string>> $metadata */
+    /**
+     * @param array<string, string|list<string>> $metadata
+     */
     public function __construct(?int $timeoutMs = null, array $metadata = []){
         if($timeoutMs !== null && $timeoutMs <= 0){
             throw new InvalidArgumentException('timeoutMs must be greater than 0.');
@@ -41,5 +43,17 @@ final readonly class RpcCallOptions{
 
         $this->timeoutMs = $timeoutMs;
         $this->metadata = $normalized;
+    }
+
+    /** @internal */
+    public function metadataBytes() : int{
+        $bytes = 0;
+        foreach($this->metadata as $key => $values){
+            $bytes += strlen($key);
+            foreach($values as $value){
+                $bytes += strlen($value);
+            }
+        }
+        return $bytes;
     }
 }

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Trix\pRPC;
 
+use Closure;
 use Google\Protobuf\Internal\Message;
 use InvalidArgumentException;
 use pocketmine\plugin\PluginBase;
@@ -12,10 +13,10 @@ use pocketmine\scheduler\TaskHandler;
 use pocketmine\snooze\SleeperHandler;
 use pocketmine\snooze\SleeperHandlerEntry;
 use RuntimeException;
-use SplPriorityQueue;
 use Throwable;
 use Trix\pRPC\exception\RpcClosedException;
 use Trix\pRPC\exception\RpcException;
+use Trix\pRPC\exception\RpcMessageTooLargeException;
 use Trix\pRPC\exception\RpcOverloadedException;
 use Trix\pRPC\exception\RpcTimeoutException;
 use Trix\pRPC\exception\RpcWorkerException;
@@ -30,36 +31,70 @@ final class RpcClient{
     /** @var list<GrpcWorkerThread> */
     private array $workers = [];
 
-    /** @var array<int, array{resolver: RpcPromiseResolver<Message>, deadlineNs: int, timeoutMs: int, worker: int}> */
-    private array $pending = [];
+    /** @var list<int> */
+    private array $workerLoads = [];
 
-    /** @var SplPriorityQueue<int, array{id: int, deadlineNs: int}> */
-    private SplPriorityQueue $deadlines;
+    /** @var list<int> */
+    private array $workerStates = [];
 
     /** @var array<int, true> */
     private array $failedWorkers = [];
 
+    /** @var array<string, int> */
+    private array $methodIdsByPath = [];
+
+    /** @var array<string, RpcMethod> */
+    private array $methodsByPath = [];
+
+    /**
+     * @var array<int, array{
+     *     resolver: RpcPromiseResolver<Message>,
+     *     responseClass: class-string<Message>,
+     *     deadlineNs: int,
+     *     timeoutMs: int,
+     *     worker: int
+     * }>
+     */
+    private array $pending = [];
+
+    private int $transportOutstanding = 0;
     private int $nextId = 1;
     private bool $closed = false;
+
+    /** @var Closure(Throwable): void */
+    private Closure $callbackErrorHandler;
 
     /**
      * @throws Throwable
      */
     public function __construct(PluginBase $plugin, private readonly RpcClientConfig $config){
-        $this->deadlines = new SplPriorityQueue();
-        $this->deadlines->setExtractFlags(SplPriorityQueue::EXTR_DATA);
         $this->sleeper = $plugin->getServer()->getTickSleeper();
+        $this->callbackErrorHandler = static function(Throwable $e) : void{
+            \GlobalLogger::get()->logException($e);
+        };
+
+        $methodPaths = [];
+        foreach($config->methods as $id => $method){
+            $this->methodIdsByPath[$method->path] = $id;
+            $this->methodsByPath[$method->path] = $method;
+            $methodPaths[$id] = $method->path;
+        }
 
         $workerConfig = serialize([
             'endpoint' => $config->endpoint,
-            'stubClass' => $config->stubClass,
             'credentials' => $config->credentials->export(),
             'channelOptions' => $config->channelOptions,
+            'methodPaths' => $methodPaths,
+            'maxRequestBytes' => $config->maxRequestBytes,
+            'maxResponseBytes' => $config->maxResponseBytes,
+            'maxMetadataBytes' => $config->maxMetadataBytes,
+            'reconnectBackoffMinMs' => $config->reconnectBackoffMinMs,
+            'reconnectBackoffMaxMs' => $config->reconnectBackoffMaxMs,
         ]);
 
         try{
             $this->sleeperEntry = $this->sleeper->addNotifier(function() : void{
-                if(!$this->closed){
+                if($this->workers !== []){
                     $this->drainResults();
                 }
             });
@@ -70,6 +105,8 @@ final class RpcClient{
                     throw new RuntimeException("Failed to start gRPC worker {$i}.");
                 }
                 $this->workers[] = $worker;
+                $this->workerLoads[] = 0;
+                $this->workerStates[] = GrpcWorkerThread::STATE_STARTING;
             }
 
             $this->timeoutTask = $plugin->getScheduler()->scheduleRepeatingTask(
@@ -101,26 +138,38 @@ final class RpcClient{
     }
 
     /**
-     * Executes a generated unary gRPC client method off the main thread.
+     * Executes a registered unary RPC without blocking the PocketMine main thread.
+     * The request is encoded once on the main thread and the response is decoded once on the main thread.
      *
+     * @template TRequest of Message
      * @template TResponse of Message
+     * @param RpcMethod<TRequest, TResponse> $method
+     * @param TRequest $request
      * @return RpcPromise<TResponse>
      */
-    public function unary(string $method, Message $request, ?RpcCallOptions $options = null) : RpcPromise{
+    public function call(RpcMethod $method, Message $request, ?RpcCallOptions $options = null) : RpcPromise{
         if($this->closed){
             return $this->rejected(new RpcClosedException());
         }
-        if($method === '' || str_starts_with($method, '__') || !method_exists($this->config->stubClass, $method)){
-            throw new InvalidArgumentException("Unknown or invalid gRPC unary method '$method'.");
+
+        $registered = $this->methodsByPath[$method->path] ?? null;
+        if($registered === null || $registered->requestClass !== $method->requestClass || $registered->responseClass !== $method->responseClass){
+            throw new InvalidArgumentException("RPC method '$method->path' is not registered in this client.");
         }
-        if(count($this->pending) >= $this->config->maxPending){
-            return $this->rejected(new RpcOverloadedException($this->config->maxPending));
+        if(!$request instanceof $method->requestClass){
+            throw new InvalidArgumentException("RPC '$method->path' expects $method->requestClass, got " . $request::class . '.');
+        }
+        if($this->transportOutstanding >= $this->config->maxOutstanding){
+            return $this->rejected(new RpcOverloadedException($this->config->maxOutstanding));
         }
 
         $options ??= new RpcCallOptions();
         $timeoutMs = $options->timeoutMs ?? $this->config->defaultTimeoutMs;
         if($timeoutMs > $this->config->maxTimeoutMs){
             throw new InvalidArgumentException("timeoutMs cannot exceed {$this->config->maxTimeoutMs} ms.");
+        }
+        if($options->metadataBytes() > $this->config->maxMetadataBytes){
+            return $this->rejected(new RpcMessageTooLargeException('metadata', $options->metadataBytes(), $this->config->maxMetadataBytes));
         }
 
         $workerIndex = $this->selectWorker();
@@ -133,29 +182,35 @@ final class RpcClient{
         }catch(Throwable $e){
             return $this->rejected(new RpcException('Request serialization failed: ' . $e->getMessage(), STATUS_INTERNAL));
         }
+        $requestBytes = strlen($requestData);
+        if($requestBytes > $this->config->maxRequestBytes){
+            return $this->rejected(new RpcMessageTooLargeException('request', $requestBytes, $this->config->maxRequestBytes));
+        }
 
         $id = $this->allocateId();
         $deadlineNs = hrtime(true) + ($timeoutMs * 1_000_000);
+        $methodId = $this->methodIdsByPath[$method->path];
 
         /** @var RpcPromiseResolver<Message> $resolver */
-        $resolver = new RpcPromiseResolver();
+        $resolver = new RpcPromiseResolver($this->callbackErrorHandler);
         $this->pending[$id] = [
             'resolver' => $resolver,
+            'responseClass' => $method->responseClass,
             'deadlineNs' => $deadlineNs,
             'timeoutMs' => $timeoutMs,
             'worker' => $workerIndex,
         ];
-        $this->deadlines->insert(['id' => $id, 'deadlineNs' => $deadlineNs], -$deadlineNs);
 
         try{
             $this->workers[$workerIndex]->enqueue(
                 $id,
-                $request::class,
+                $methodId,
                 $requestData,
-                $method,
                 $options->metadata,
                 $deadlineNs
             );
+            ++$this->workerLoads[$workerIndex];
+            ++$this->transportOutstanding;
         }catch(Throwable $e){
             unset($this->pending[$id]);
             $resolver->reject(new RpcWorkerException('Failed to queue RPC: ' . $e->getMessage()));
@@ -168,15 +223,32 @@ final class RpcClient{
         return count($this->pending);
     }
 
+    /** Counts jobs we've already timed out locally but the worker hasn't released yet. */
+    public function outstandingCount() : int{
+        return $this->transportOutstanding;
+    }
+
     public function isClosed() : bool{
         return $this->closed;
     }
 
+    public function stats() : RpcClientStats{
+        return new RpcClientStats(
+            count($this->pending),
+            $this->transportOutstanding,
+            $this->workerLoads,
+            array_map(GrpcWorkerThread::stateName(...), $this->workerStates)
+        );
+    }
+
     /**
-     * Stops accepting work, drains queued RPCs for up to the grace period, joins workers,
-     * removes the sleeper notifier and rejects anything that could not finish.
+     * Stops taking new work and asks workers to wrap up quickly.
+     *
+     * PHP gRPC's UnaryCall::wait() blocks inside the worker, so we can't forcibly interrupt
+     * a call already running on another thread — worst case we wait out its full RPC deadline.
+     * Keep maxTimeoutMs small for DB traffic (default 5s).
      */
-    public function close(int $gracePeriodMs = 1_000) : void{
+    public function close(int $gracePeriodMs = 500) : void{
         if($this->closed){
             return;
         }
@@ -193,17 +265,17 @@ final class RpcClient{
         }
 
         $graceDeadline = hrtime(true) + ($gracePeriodMs * 1_000_000);
-        while($this->hasOutstandingWorkerWork() && hrtime(true) < $graceDeadline){
+        while($this->transportOutstanding > 0 && hrtime(true) < $graceDeadline){
             $this->drainResults();
             $this->expireDeadlines();
-            usleep(500);
+            usleep(250);
         }
 
         foreach($this->workers as $worker){
-            if($worker->getOutstanding() > 0){
-                $worker->requestStop(true);
-            }
+            $worker->requestStop(true);
         }
+
+        $this->rejectAllPending(new RpcClosedException('RPC client closed before the request completed.'));
 
         foreach($this->workers as $worker){
             try{
@@ -213,27 +285,28 @@ final class RpcClient{
         }
 
         $this->drainResults();
-        $this->rejectAllPending(new RpcClosedException('RPC client closed before the request completed.'));
         $this->workers = [];
+        $this->workerLoads = [];
+        $this->workerStates = [];
+        $this->transportOutstanding = 0;
 
         if($this->sleeperEntry !== null){
             $this->sleeper->removeNotifier($this->sleeperEntry->getNotifierId());
             $this->sleeperEntry = null;
         }
-
-        $this->deadlines = new SplPriorityQueue();
-        $this->deadlines->setExtractFlags(SplPriorityQueue::EXTR_DATA);
     }
 
     private function tick() : void{
         $this->drainResults();
         $this->expireDeadlines();
+        $this->refreshWorkerStates();
         $this->detectWorkerFailures();
     }
 
     private function drainResults() : void{
-        foreach($this->workers as $worker){
+        foreach($this->workers as $workerIndex => $worker){
             foreach($worker->drainResults() as $payload){
+                $this->releaseTransportSlot($workerIndex);
                 $this->handleResult($payload);
             }
         }
@@ -245,11 +318,11 @@ final class RpcClient{
         }catch(Throwable){
             return;
         }
-        if(!is_array($result) || !isset($result['id'])){
+        if(!is_array($result) || !isset($result[0]) || !is_int($result[0])){
             return;
         }
 
-        $id = (int) $result['id'];
+        $id = $result[0];
         $pending = $this->pending[$id] ?? null;
         if($pending === null){
             return;
@@ -258,48 +331,64 @@ final class RpcClient{
         unset($this->pending[$id]);
         $resolver = $pending['resolver'];
 
-        if(($result['ok'] ?? false) !== true){
+        if(($result[1] ?? null) !== true){
             $resolver->reject(new RpcException(
-                is_string($result['message'] ?? null) ? $result['message'] : 'Unknown gRPC error.',
-                is_int($result['statusCode'] ?? null) ? $result['statusCode'] : STATUS_INTERNAL,
-                is_array($result['metadata'] ?? null) ? $result['metadata'] : []
+                is_string($result[3] ?? null) ? $result[3] : 'Unknown gRPC error.',
+                is_int($result[2] ?? null) ? $result[2] : STATUS_INTERNAL,
+                is_array($result[4] ?? null) ? $result[4] : []
             ));
             return;
         }
 
-        try{
-            $responseClass = $result['responseClass'] ?? null;
-            $responseData = $result['responseData'] ?? null;
-            if(!is_string($responseClass) || !is_a($responseClass, Message::class, true) || !is_string($responseData)){
-                throw new RuntimeException('Worker returned an invalid protobuf response frame.');
-            }
+        $responseData = $result[2] ?? null;
+        if(!is_string($responseData)){
+            $resolver->reject(new RpcException('Worker returned an invalid protobuf response frame.', STATUS_INTERNAL));
+            return;
+        }
 
+        $responseBytes = strlen($responseData);
+        if($responseBytes > $this->config->maxResponseBytes){
+            $resolver->reject(new RpcMessageTooLargeException('response', $responseBytes, $this->config->maxResponseBytes));
+            return;
+        }
+
+        try{
+            $responseClass = $pending['responseClass'];
             $response = new $responseClass();
             $response->mergeFromString($responseData);
-            $resolver->resolve($response);
         }catch(Throwable $e){
             $resolver->reject(new RpcException('Response decode failed: ' . $e->getMessage(), STATUS_INTERNAL));
+            return;
+        }
+
+        $resolver->resolve($response);
+    }
+
+    /**
+     * A bounded linear scan is cheaper and simpler than retaining stale SplPriorityQueue entries.
+     * At the default 4096-outstanding cap this is at most ~82k integer comparisons/sec at 20 TPS.
+     */
+    private function expireDeadlines() : void{
+        if($this->pending === []){
+            return;
+        }
+
+        $now = hrtime(true);
+        foreach($this->pending as $id => $pending){
+            if($pending['deadlineNs'] > $now){
+                continue;
+            }
+            unset($this->pending[$id]);
+            $pending['resolver']->reject(new RpcTimeoutException($pending['timeoutMs']));
         }
     }
 
-    private function expireDeadlines() : void{
-        $now = hrtime(true);
-
-        while(!$this->deadlines->isEmpty()){
-            /** @var array{id: int, deadlineNs: int} $entry */
-            $entry = $this->deadlines->current();
-            if($entry['deadlineNs'] > $now){
-                break;
-            }
-
-            $entry = $this->deadlines->extract();
-            $pending = $this->pending[$entry['id']] ?? null;
-            if($pending === null || $pending['deadlineNs'] !== $entry['deadlineNs']){
+    private function refreshWorkerStates() : void{
+        foreach($this->workers as $index => $worker){
+            if(isset($this->failedWorkers[$index]) || $worker->isTerminated()){
                 continue;
             }
-
-            unset($this->pending[$entry['id']]);
-            $pending['resolver']->reject(new RpcTimeoutException($pending['timeoutMs']));
+            $this->workerStates[$index] = $worker->getState();
         }
     }
 
@@ -310,7 +399,18 @@ final class RpcClient{
             }
 
             $this->failedWorkers[$index] = true;
-            $error = new RpcWorkerException("gRPC worker $index terminated unexpectedly.");
+            $this->workerStates[$index] = GrpcWorkerThread::STATE_FAILED;
+
+            $lostSlots = $this->workerLoads[$index] ?? 0;
+            $this->workerLoads[$index] = 0;
+            $this->transportOutstanding = max(0, $this->transportOutstanding - $lostSlots);
+
+            $lastError = $worker->getLastError();
+            $message = "gRPC worker $index terminated unexpectedly.";
+            if($lastError !== ''){
+                $message .= ' Last error: ' . $lastError;
+            }
+            $error = new RpcWorkerException($message);
 
             foreach($this->pending as $id => $pending){
                 if($pending['worker'] === $index){
@@ -323,18 +423,22 @@ final class RpcClient{
 
     private function selectWorker() : ?int{
         $selected = null;
-        $lowestOutstanding = PHP_INT_MAX;
+        $lowestLoad = PHP_INT_MAX;
 
-        foreach($this->workers as $index => $worker){
-            if(isset($this->failedWorkers[$index]) || $worker->isTerminated()){
+        foreach($this->workerLoads as $index => $load){
+            if(isset($this->failedWorkers[$index])){
                 continue;
             }
 
-            $outstanding = $worker->getOutstanding();
-            if($outstanding < $lowestOutstanding){
-                $lowestOutstanding = $outstanding;
+            $state = $this->workerStates[$index] ?? GrpcWorkerThread::STATE_STARTING;
+            if($state === GrpcWorkerThread::STATE_BACKOFF || $state === GrpcWorkerThread::STATE_STOPPING || $state === GrpcWorkerThread::STATE_FAILED){
+                continue;
+            }
+
+            if($load < $lowestLoad){
+                $lowestLoad = $load;
                 $selected = $index;
-                if($outstanding === 0){
+                if($load === 0){
                     break;
                 }
             }
@@ -343,18 +447,23 @@ final class RpcClient{
         return $selected;
     }
 
+    private function releaseTransportSlot(int $workerIndex) : void{
+        if(($this->workerLoads[$workerIndex] ?? 0) > 0){
+            --$this->workerLoads[$workerIndex];
+        }
+        if($this->transportOutstanding > 0){
+            --$this->transportOutstanding;
+        }
+    }
+
     private function allocateId() : int{
         if($this->nextId === PHP_INT_MAX){
-            if($this->pending !== []){
+            if($this->transportOutstanding !== 0){
                 throw new RuntimeException('RPC request ID space exhausted.');
             }
             $this->nextId = 1;
         }
         return $this->nextId++;
-    }
-
-    private function hasOutstandingWorkerWork() : bool{
-        return array_any($this->workers, fn($worker) => $worker->getOutstanding() > 0);
     }
 
     private function rejectAllPending(Throwable $error) : void{
@@ -368,7 +477,7 @@ final class RpcClient{
     /** @template TValue @return RpcPromise<TValue> */
     private function rejected(Throwable $error) : RpcPromise{
         /** @var RpcPromiseResolver<TValue> $resolver */
-        $resolver = new RpcPromiseResolver();
+        $resolver = new RpcPromiseResolver($this->callbackErrorHandler);
         $resolver->reject($error);
         return $resolver->promise();
     }

@@ -7,7 +7,7 @@ namespace Trix\pRPC\exception;
 use const Grpc\STATUS_RESOURCE_EXHAUSTED;
 
 final class RpcOverloadedException extends RpcException{
-    public function __construct(int $maxPending){
-        parent::__construct("RPC client has reached its $maxPending-request pending limit.", STATUS_RESOURCE_EXHAUSTED);
+    public function __construct(int $maxOutstanding){
+        parent::__construct("RPC transport has reached its {$maxOutstanding}-request outstanding limit.", STATUS_RESOURCE_EXHAUSTED);
     }
 }

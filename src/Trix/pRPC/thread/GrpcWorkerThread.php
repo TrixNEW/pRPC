@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace Trix\pRPC\thread;
 
-use Google\Protobuf\Internal\Message;
 use Grpc\BaseStub;
 use Grpc\ChannelCredentials;
 use Grpc\UnaryCall;
@@ -14,19 +13,33 @@ use pocketmine\snooze\SleeperNotifier;
 use pocketmine\thread\Thread;
 use RuntimeException;
 use Throwable;
+use Trix\pRPC\internal\FastGrpcStub;
+use Trix\pRPC\internal\RawMessage;
 use const Grpc\STATUS_DEADLINE_EXCEEDED;
 use const Grpc\STATUS_INTERNAL;
 use const Grpc\STATUS_OK;
 use const Grpc\STATUS_UNKNOWN;
+use const Grpc\STATUS_UNAVAILABLE;
 
 /** @internal */
 final class GrpcWorkerThread extends Thread{
+    private const MAX_ERROR_MESSAGE_BYTES = 8_192;
+
+    public const STATE_STARTING = 0;
+    public const STATE_READY = 1;
+    public const STATE_BACKOFF = 2;
+    public const STATE_STOPPING = 3;
+    public const STATE_FAILED = 4;
+
     private ThreadSafeArray $queue;
     private ThreadSafeArray $results;
 
     private bool $stopping = false;
     private bool $stoppedNormally = false;
     private int $outstanding = 0;
+    private int $state = self::STATE_STARTING;
+    private string $lastError = '';
+    private int $maxMetadataBytes = 32_768;
 
     public function __construct(
         private string $serializedConfig,
@@ -38,22 +51,15 @@ final class GrpcWorkerThread extends Thread{
         $this->results = new ThreadSafeArray();
     }
 
+    /** @param array<string, list<string>> $metadata */
     public function enqueue(
         int $id,
-        string $requestClass,
+        int $methodId,
         string $requestData,
-        string $method,
         array $metadata,
         int $deadlineNs
     ) : void{
-        $payload = serialize([
-            'id' => $id,
-            'requestClass' => $requestClass,
-            'requestData' => $requestData,
-            'method' => $method,
-            'metadata' => $metadata,
-            'deadlineNs' => $deadlineNs,
-        ]);
+        $payload = serialize([$id, $methodId, $deadlineNs, $metadata, $requestData]);
 
         $this->synchronized(function() use ($payload) : void{
             if($this->stopping){
@@ -67,6 +73,14 @@ final class GrpcWorkerThread extends Thread{
 
     public function getOutstanding() : int{
         return $this->synchronized(fn() : int => $this->outstanding);
+    }
+
+    public function getState() : int{
+        return $this->synchronized(fn() : int => $this->state);
+    }
+
+    public function getLastError() : string{
+        return $this->synchronized(fn() : string => $this->lastError);
     }
 
     /** @return list<string> */
@@ -90,6 +104,7 @@ final class GrpcWorkerThread extends Thread{
     public function requestStop(bool $discardQueued = false) : void{
         $this->synchronized(function() use ($discardQueued) : void{
             $this->stopping = true;
+            $this->state = self::STATE_STOPPING;
 
             if($discardQueued){
                 $discarded = 0;
@@ -111,37 +126,51 @@ final class GrpcWorkerThread extends Thread{
 
     protected function onRun() : void{
         $notifier = $this->sleeperEntry->createNotifier();
-        $config = $this->decodeArray($this->serializedConfig, 'worker config');
+        $config = $this->decodeConfig($this->serializedConfig);
         $client = null;
         $normalExit = false;
+        $backoffMs = (int) $config['reconnectBackoffMinMs'];
+        $this->maxMetadataBytes = (int) $config['maxMetadataBytes'];
 
         try{
-            while(($batch = $this->nextBatch()) !== null){
+            while(true){
+                if($client === null){
+                    if($this->shouldStopNow()){
+                        break;
+                    }
+
+                    try{
+                        $client = $this->createClient($config);
+                        $this->setState(self::STATE_READY, '');
+                        $backoffMs = (int) $config['reconnectBackoffMinMs'];
+                        $this->maxMetadataBytes = (int) $config['maxMetadataBytes'];
+                    }catch(Throwable $e){
+                        $this->setState(self::STATE_BACKOFF, $e->getMessage());
+                        $this->failQueuedWithoutClient($notifier, $e->getMessage());
+                        if(!$this->waitBackoff($backoffMs)){
+                            break;
+                        }
+                        $backoffMs = min($backoffMs * 2, (int) $config['reconnectBackoffMaxMs']);
+                        continue;
+                    }
+                }
+
+                $batch = $this->nextBatch();
+                if($batch === null){
+                    break;
+                }
                 if($batch === []){
                     continue;
                 }
 
-                try{
-                    $client ??= $this->createClient($config);
-                }catch(Throwable $e){
-                    foreach($batch as $payload){
-                        $job = $this->tryDecodeJob($payload);
-                        if($job !== null){
-                            $this->publishError(
-                                (int) $job['id'],
-                                STATUS_INTERNAL,
-                                'Unable to initialize gRPC client: ' . $e->getMessage(),
-                                [],
-                                $notifier
-                            );
-                        }else{
-                            $this->decrementOutstanding();
-                        }
+                if($this->processBatch($batch, $client, $notifier, $config)){
+                    try{
+                        $client->close();
+                    }catch(Throwable){
                     }
-                    continue;
+                    $client = null;
+                    $this->setState(self::STATE_STARTING, '');
                 }
-
-                $this->processBatch($batch, $client, $notifier);
             }
             $normalExit = true;
         }finally{
@@ -149,12 +178,12 @@ final class GrpcWorkerThread extends Thread{
                 try{
                     $client->close();
                 }catch(Throwable){
-                    // ...
                 }
             }
 
             $this->synchronized(function() use ($normalExit) : void{
                 $this->stoppedNormally = $normalExit;
+                $this->state = $normalExit ? self::STATE_STOPPING : self::STATE_FAILED;
             });
         }
     }
@@ -172,10 +201,12 @@ final class GrpcWorkerThread extends Thread{
 
             $batch = [];
             foreach($this->queue as $key => $payload){
+                unset($this->queue[$key]);
                 if(is_string($payload)){
                     $batch[] = $payload;
+                }else{
+                    $this->outstanding = max(0, $this->outstanding - 1);
                 }
-                unset($this->queue[$key]);
 
                 if(count($batch) >= $this->batchSize){
                     break;
@@ -185,54 +216,53 @@ final class GrpcWorkerThread extends Thread{
         });
     }
 
-    private function processBatch(array $batch, ?BaseStub &$client, SleeperNotifier $notifier) : void{
-        /** @var list<array{id: int, call: UnaryCall}> $calls */
+    /**
+     * @param array<string, mixed> $config
+     * @return bool true when the channel should be recreated
+     */
+    private function processBatch(array $batch, FastGrpcStub $client, SleeperNotifier $notifier, array $config) : bool{
+        /** @var list<array{id: int, deadlineNs: int, call: UnaryCall}> $calls */
         $calls = [];
-        $resetClientAfterBatch = false;
+        $resetClient = false;
+        /** @var list<string> $methodPaths */
+        $methodPaths = $config['methodPaths'];
+        $maxRequestBytes = (int) $config['maxRequestBytes'];
+        $maxResponseBytes = (int) $config['maxResponseBytes'];
 
         foreach($batch as $payload){
-            $job = $this->tryDecodeJob($payload);
+            $job = $this->decodeJob($payload);
             if($job === null){
                 $this->decrementOutstanding();
                 continue;
             }
 
-            $id = (int) $job['id'];
+            [$id, $methodId, $deadlineNs, $metadata, $requestData] = $job;
 
             try{
-                $deadlineNs = (int) $job['deadlineNs'];
                 $now = hrtime(true);
                 if($deadlineNs <= $now){
                     $this->publishError($id, STATUS_DEADLINE_EXCEEDED, 'RPC deadline exceeded before execution.', [], $notifier);
                     continue;
                 }
-
-                $requestClass = $job['requestClass'];
-                if(!is_string($requestClass) || !is_a($requestClass, Message::class, true)){
-                    throw new RuntimeException('Request class is not a protobuf Message.');
+                if(strlen($requestData) > $maxRequestBytes){
+                    $this->publishError($id, STATUS_INTERNAL, 'RPC request exceeded the configured worker limit.', [], $notifier);
+                    continue;
                 }
 
-                $method = $job['method'];
-                if(!is_string($method) || $method === '' || str_starts_with($method, '__') || !method_exists($client, $method)){
-                    throw new RuntimeException('Unknown or invalid gRPC unary method.');
+                $path = $methodPaths[$methodId] ?? null;
+                if(!is_string($path)){
+                    throw new RuntimeException('Unknown RPC method ID.');
                 }
-
-                $request = new $requestClass();
-                $request->mergeFromString((string) $job['requestData']);
 
                 $remainingUs = max(1, intdiv($deadlineNs - hrtime(true), 1_000));
-                $metadata = is_array($job['metadata'] ?? null) ? $job['metadata'] : [];
-                $call = $client->{$method}($request, $metadata, ['timeout' => $remainingUs]);
-
-                if(!$call instanceof UnaryCall){
-                    throw new RuntimeException("{$method} is not a unary gRPC method.");
-                }
-
-                $calls[] = ['id' => $id, 'call' => $call];
+                $call = $client->rawUnary($path, $requestData, $metadata, ['timeout' => $remainingUs]);
+                $calls[] = ['id' => $id, 'deadlineNs' => $deadlineNs, 'call' => $call];
             }catch(Throwable $e){
                 $this->publishError($id, STATUS_INTERNAL, 'RPC dispatch failed: ' . $e->getMessage(), [], $notifier);
             }
         }
+
+        usort($calls, static fn(array $a, array $b) : int => $a['deadlineNs'] <=> $b['deadlineNs']);
 
         foreach($calls as $entry){
             $id = $entry['id'];
@@ -248,37 +278,35 @@ final class GrpcWorkerThread extends Thread{
                     continue;
                 }
 
-                if(!$response instanceof Message){
-                    $this->publishError($id, STATUS_INTERNAL, 'gRPC returned OK without a protobuf response.', $metadata, $notifier);
+                if(!$response instanceof RawMessage){
+                    $this->publishError($id, STATUS_INTERNAL, 'gRPC returned OK without a raw protobuf response.', $metadata, $notifier);
                     continue;
                 }
 
-                $this->publishSuccess($id, $response, $notifier);
+                $responseData = $response->bytes();
+                if(strlen($responseData) > $maxResponseBytes){
+                    $this->publishError($id, STATUS_INTERNAL, 'RPC response exceeded the configured worker limit.', $metadata, $notifier);
+                    continue;
+                }
+
+                $this->publishSuccess($id, $responseData, $notifier);
             }catch(Throwable $e){
-                $resetClientAfterBatch = true;
-                $this->publishError($id, STATUS_UNKNOWN, 'gRPC wait failed: ' . $e->getMessage(), [], $notifier);
+                $resetClient = true;
+                $this->publishError($id, STATUS_UNAVAILABLE, 'gRPC wait failed: ' . $e->getMessage(), [], $notifier);
             }
         }
 
-        if($resetClientAfterBatch){
-            try{
-                $client->close();
-            }catch(Throwable){
-            }
-            $client = null;
-        }
+        return $resetClient;
     }
 
-    /** @param array<string, mixed> $config */
-    private function createClient(array $config) : BaseStub{
-        $class = $config['stubClass'] ?? null;
-        $endpoint = $config['endpoint'] ?? null;
-        $channelOptions = $config['channelOptions'] ?? null;
-        $credentials = $config['credentials'] ?? null;
+    /** @param array<string, mixed> $config
+     * @throws \Exception
+     */
+    private function createClient(array $config) : FastGrpcStub{
+        $endpoint = $config['endpoint'];
+        $channelOptions = $config['channelOptions'];
+        $credentials = $config['credentials'];
 
-        if(!is_string($class) || !is_a($class, BaseStub::class, true)){
-            throw new RuntimeException('Invalid gRPC stub class.');
-        }
         if(!is_string($endpoint) || !is_array($channelOptions) || !is_array($credentials)){
             throw new RuntimeException('Invalid gRPC worker configuration.');
         }
@@ -293,37 +321,40 @@ final class GrpcWorkerThread extends Thread{
             default => throw new RuntimeException('Unknown gRPC credential mode.'),
         };
 
-        $client = new $class($endpoint, $channelOptions);
-        if(!$client instanceof BaseStub){
-            throw new RuntimeException('Generated client did not produce a BaseStub.');
-        }
-        return $client;
+        return new FastGrpcStub($endpoint, $channelOptions);
     }
 
-    private function publishSuccess(int $id, Message $response, SleeperNotifier $notifier) : void{
-        try{
-            $payload = serialize([
-                'id' => $id,
-                'ok' => true,
-                'responseClass' => $response::class,
-                'responseData' => $response->serializeToString(),
-            ]);
-            $this->publish($payload, $notifier);
-        }catch(Throwable $e){
-            $this->publishError($id, STATUS_INTERNAL, 'Response serialization failed: ' . $e->getMessage(), [], $notifier);
-        }
+    private function publishSuccess(int $id, string $responseData, SleeperNotifier $notifier) : void{
+        $this->publish(serialize([$id, true, $responseData]), $notifier);
     }
 
     /** @param array<string, mixed> $metadata */
     private function publishError(int $id, int $statusCode, string $message, array $metadata, SleeperNotifier $notifier) : void{
-        $payload = serialize([
-            'id' => $id,
-            'ok' => false,
-            'statusCode' => $statusCode,
-            'message' => $message,
-            'metadata' => $metadata,
-        ]);
-        $this->publish($payload, $notifier);
+        if(strlen($message) > self::MAX_ERROR_MESSAGE_BYTES){
+            $message = substr($message, 0, self::MAX_ERROR_MESSAGE_BYTES);
+        }
+        $this->publish(serialize([$id, false, $statusCode, $message, $this->boundedMetadata($metadata)]), $notifier);
+    }
+
+    /** @param array<string, mixed> $metadata @return array<string, mixed> */
+    private function boundedMetadata(array $metadata) : array{
+        $bytes = 0;
+        foreach($metadata as $key => $values){
+            if(!is_string($key) || !is_array($values)){
+                return [];
+            }
+            $bytes += strlen($key);
+            foreach($values as $value){
+                if(!is_string($value)){
+                    return [];
+                }
+                $bytes += strlen($value);
+                if($bytes > $this->maxMetadataBytes){
+                    return [];
+                }
+            }
+        }
+        return $metadata;
     }
 
     private function publish(string $payload, SleeperNotifier $notifier) : void{
@@ -340,23 +371,109 @@ final class GrpcWorkerThread extends Thread{
         });
     }
 
-    /** @return array<string, mixed>|null */
-    private function tryDecodeJob(string $payload) : ?array{
-        try{
-            $job = unserialize($payload, ['allowed_classes' => false]);
-            return is_array($job) && isset($job['id']) ? $job : null;
-        }catch(Throwable){
-            return null;
+    private function failQueuedWithoutClient(SleeperNotifier $notifier, string $reason) : void{
+        while(($batch = $this->takeAvailableBatch()) !== []){
+            foreach($batch as $payload){
+                $job = $this->decodeJob($payload);
+                if($job === null){
+                    $this->decrementOutstanding();
+                    continue;
+                }
+                $this->publishError($job[0], STATUS_UNAVAILABLE, 'Unable to initialize gRPC client: ' . $reason, [], $notifier);
+            }
         }
     }
 
+    /** @return list<string> */
+    private function takeAvailableBatch() : array{
+        return $this->synchronized(function() : array{
+            $batch = [];
+            foreach($this->queue as $key => $payload){
+                unset($this->queue[$key]);
+                if(is_string($payload)){
+                    $batch[] = $payload;
+                }else{
+                    $this->outstanding = max(0, $this->outstanding - 1);
+                }
+                if(count($batch) >= $this->batchSize){
+                    break;
+                }
+            }
+            return $batch;
+        });
+    }
+
+    private function waitBackoff(int $milliseconds) : bool{
+        $deadlineNs = hrtime(true) + ($milliseconds * 1_000_000);
+        return $this->synchronized(function() use ($deadlineNs) : bool{
+            while(!$this->stopping){
+                $remainingNs = $deadlineNs - hrtime(true);
+                if($remainingNs <= 0){
+                    return true;
+                }
+                $this->wait(max(1, intdiv($remainingNs, 1_000)));
+            }
+            return false;
+        });
+    }
+
+    private function shouldStopNow() : bool{
+        return $this->synchronized(fn() : bool => $this->stopping && $this->queue->count() === 0);
+    }
+
+    private function setState(int $state, string $lastError) : void{
+        $this->synchronized(function() use ($state, $lastError) : void{
+            $this->state = $state;
+            $this->lastError = $lastError;
+        });
+    }
+
+    /**
+     * @return array{0: int, 1: int, 2: int, 3: array<string, list<string>>, 4: string}|null
+     */
+    private function decodeJob(string $payload) : ?array{
+        try{
+            $job = unserialize($payload, ['allowed_classes' => false]);
+        }catch(Throwable){
+            return null;
+        }
+
+        if(!is_array($job) || count($job) !== 5){
+            return null;
+        }
+        [$id, $methodId, $deadlineNs, $metadata, $requestData] = $job;
+        if(!is_int($id) || !is_int($methodId) || !is_int($deadlineNs) || !is_array($metadata) || !is_string($requestData)){
+            return null;
+        }
+        return [$id, $methodId, $deadlineNs, $metadata, $requestData];
+    }
+
     /** @return array<string, mixed> */
-    private function decodeArray(string $payload, string $what) : array{
+    private function decodeConfig(string $payload) : array{
         $decoded = unserialize($payload, ['allowed_classes' => false]);
         if(!is_array($decoded)){
-            throw new RuntimeException("Invalid $what payload.");
+            throw new RuntimeException('Invalid gRPC worker configuration payload.');
+        }
+        foreach(['endpoint', 'credentials', 'channelOptions', 'methodPaths', 'maxRequestBytes', 'maxResponseBytes', 'maxMetadataBytes', 'reconnectBackoffMinMs', 'reconnectBackoffMaxMs'] as $key){
+            if(!array_key_exists($key, $decoded)){
+                throw new RuntimeException("Missing gRPC worker configuration key '{$key}'.");
+            }
+        }
+        if(!is_array($decoded['methodPaths'])){
+            throw new RuntimeException('Invalid method path registry.');
         }
         return $decoded;
+    }
+
+    public static function stateName(int $state) : string{
+        return match($state){
+            self::STATE_STARTING => 'starting',
+            self::STATE_READY => 'ready',
+            self::STATE_BACKOFF => 'backoff',
+            self::STATE_STOPPING => 'stopping',
+            self::STATE_FAILED => 'failed',
+            default => 'unknown',
+        };
     }
 
     public function getThreadName() : string{

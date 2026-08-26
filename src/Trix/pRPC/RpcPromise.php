@@ -9,6 +9,8 @@ use LogicException;
 use Throwable;
 
 /**
+ * main-thread promise for RPC completion.
+ *
  * @template TValue
  */
 final class RpcPromise{
@@ -20,21 +22,24 @@ final class RpcPromise{
     private mixed $value = null;
     private ?Throwable $error = null;
 
-    /** @var array<int, Closure(TValue): void> */
+    /** @var list<Closure(TValue): void> */
     private array $successCallbacks = [];
 
-    /** @var array<int, Closure(Throwable): void> */
+    /** @var list<Closure(Throwable): void> */
     private array $errorCallbacks = [];
 
-    /** @var array<int, Closure(): void> */
+    /** @var list<Closure(): void> */
     private array $alwaysCallbacks = [];
+
+    /** @param Closure(Throwable): void $callbackErrorHandler */
+    public function __construct(private readonly Closure $callbackErrorHandler){}
 
     /** @phpstan-param Closure(TValue): void $callback */
     public function then(Closure $callback) : self{
         if($this->state === self::RESOLVED){
-            $callback($this->value);
+            $this->invoke($callback, $this->value);
         }elseif($this->state === self::PENDING){
-            $this->successCallbacks[spl_object_id($callback)] = $callback;
+            $this->successCallbacks[] = $callback;
         }
         return $this;
     }
@@ -42,9 +47,9 @@ final class RpcPromise{
     /** @param Closure(Throwable): void $callback */
     public function onError(Closure $callback) : self{
         if($this->state === self::REJECTED){
-            $callback($this->error);
+            $this->invoke($callback, $this->error);
         }elseif($this->state === self::PENDING){
-            $this->errorCallbacks[spl_object_id($callback)] = $callback;
+            $this->errorCallbacks[] = $callback;
         }
         return $this;
     }
@@ -52,9 +57,9 @@ final class RpcPromise{
     /** @param Closure(): void $callback */
     public function always(Closure $callback) : self{
         if($this->state === self::PENDING){
-            $this->alwaysCallbacks[spl_object_id($callback)] = $callback;
+            $this->alwaysCallbacks[] = $callback;
         }else{
-            $callback();
+            $this->invoke($callback);
         }
         return $this;
     }
@@ -84,14 +89,11 @@ final class RpcPromise{
         $always = $this->alwaysCallbacks;
         $this->clearCallbacks();
 
-        try{
-            foreach($success as $callback){
-                $callback($value);
-            }
-        }finally{
-            foreach($always as $callback){
-                $callback();
-            }
+        foreach($success as $callback){
+            $this->invoke($callback, $value);
+        }
+        foreach($always as $callback){
+            $this->invoke($callback);
         }
     }
 
@@ -108,13 +110,21 @@ final class RpcPromise{
         $always = $this->alwaysCallbacks;
         $this->clearCallbacks();
 
+        foreach($errors as $callback){
+            $this->invoke($callback, $error);
+        }
+        foreach($always as $callback){
+            $this->invoke($callback);
+        }
+    }
+
+    private function invoke(Closure $callback, mixed ...$args) : void{
         try{
-            foreach($errors as $callback){
-                $callback($error);
-            }
-        }finally{
-            foreach($always as $callback){
-                $callback();
+            $callback(...$args);
+        }catch(Throwable $e){
+            try{
+                ($this->callbackErrorHandler)($e);
+            }catch(Throwable){
             }
         }
     }
