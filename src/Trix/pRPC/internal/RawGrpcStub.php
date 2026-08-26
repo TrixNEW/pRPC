@@ -8,8 +8,10 @@ use Grpc\BaseStub;
 use Grpc\UnaryCall;
 use RuntimeException;
 
-/** @internal */
-final class FastGrpcStub extends BaseStub{
+/**
+ * @internal
+ */
+final class RawGrpcStub extends BaseStub{
     /**
      * Starts a unary request using already serialized protobuf bytes.
      * This bypasses generated request/response object construction in the worker.

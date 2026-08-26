@@ -2,9 +2,10 @@
 
 declare(strict_types=1);
 
-namespace Trix\pRPC;
+namespace Trix\pRPC\opts;
 
 use InvalidArgumentException;
+use Trix\pRPC\RpcMethod;
 
 final readonly class RpcClientConfig{
     public RpcCredentials $credentials;

@@ -14,13 +14,18 @@ use pocketmine\snooze\SleeperHandler;
 use pocketmine\snooze\SleeperHandlerEntry;
 use RuntimeException;
 use Throwable;
-use Trix\pRPC\exception\RpcClosedException;
-use Trix\pRPC\exception\RpcException;
-use Trix\pRPC\exception\RpcMessageTooLargeException;
-use Trix\pRPC\exception\RpcOverloadedException;
-use Trix\pRPC\exception\RpcTimeoutException;
-use Trix\pRPC\exception\RpcWorkerException;
+use Trix\pRPC\opts\RpcCallOptions;
+use Trix\pRPC\opts\RpcClientConfig;
+use Trix\pRPC\stats\RpcClientStats;
 use Trix\pRPC\thread\GrpcWorkerThread;
+use Trix\pRPC\utils\exception\RpcClosedException;
+use Trix\pRPC\utils\exception\RpcException;
+use Trix\pRPC\utils\exception\RpcMessageTooLargeException;
+use Trix\pRPC\utils\exception\RpcOverloadedException;
+use Trix\pRPC\utils\exception\RpcTimeoutException;
+use Trix\pRPC\utils\exception\RpcWorkerException;
+use Trix\pRPC\utils\promise\RpcPromise;
+use Trix\pRPC\utils\promise\RpcPromiseResolver;
 use const Grpc\STATUS_INTERNAL;
 
 final class RpcClient{

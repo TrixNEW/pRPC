@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Trix\pRPC;
+namespace Trix\pRPC\utils\promise;
 
 use Closure;
 use Throwable;

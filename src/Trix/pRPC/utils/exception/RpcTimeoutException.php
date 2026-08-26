@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Trix\pRPC\exception;
+namespace Trix\pRPC\utils\exception;
 
 use const Grpc\STATUS_DEADLINE_EXCEEDED;
 

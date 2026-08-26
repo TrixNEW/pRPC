@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Trix\pRPC;
+namespace Trix\pRPC\utils\promise;
 
 use Closure;
 use LogicException;
@@ -22,13 +22,13 @@ final class RpcPromise{
     private mixed $value = null;
     private ?Throwable $error = null;
 
-    /** @var list<Closure(TValue): void> */
+    /** @var Closure */
     private array $successCallbacks = [];
 
-    /** @var list<Closure(Throwable): void> */
+    /** @var Closure */
     private array $errorCallbacks = [];
 
-    /** @var list<Closure(): void> */
+    /** @var Closure */
     private array $alwaysCallbacks = [];
 
     /** @param Closure(Throwable): void $callbackErrorHandler */

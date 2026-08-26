@@ -13,7 +13,7 @@ use pocketmine\snooze\SleeperNotifier;
 use pocketmine\thread\Thread;
 use RuntimeException;
 use Throwable;
-use Trix\pRPC\internal\FastGrpcStub;
+use Trix\pRPC\internal\RawGrpcStub;
 use Trix\pRPC\internal\RawMessage;
 use const Grpc\STATUS_DEADLINE_EXCEEDED;
 use const Grpc\STATUS_INTERNAL;
@@ -220,7 +220,7 @@ final class GrpcWorkerThread extends Thread{
      * @param array<string, mixed> $config
      * @return bool true when the channel should be recreated
      */
-    private function processBatch(array $batch, FastGrpcStub $client, SleeperNotifier $notifier, array $config) : bool{
+    private function processBatch(array $batch, RawGrpcStub $client, SleeperNotifier $notifier, array $config) : bool{
         /** @var list<array{id: int, deadlineNs: int, call: UnaryCall}> $calls */
         $calls = [];
         $resetClient = false;
@@ -302,7 +302,7 @@ final class GrpcWorkerThread extends Thread{
     /** @param array<string, mixed> $config
      * @throws \Exception
      */
-    private function createClient(array $config) : FastGrpcStub{
+    private function createClient(array $config) : RawGrpcStub{
         $endpoint = $config['endpoint'];
         $channelOptions = $config['channelOptions'];
         $credentials = $config['credentials'];
@@ -321,7 +321,7 @@ final class GrpcWorkerThread extends Thread{
             default => throw new RuntimeException('Unknown gRPC credential mode.'),
         };
 
-        return new FastGrpcStub($endpoint, $channelOptions);
+        return new RawGrpcStub($endpoint, $channelOptions);
     }
 
     private function publishSuccess(int $id, string $responseData, SleeperNotifier $notifier) : void{
