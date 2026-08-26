@@ -1,0 +1,18 @@
+{
+  "name": "trix/prpc",
+  "description": "High-performance gRPC library for Quark",
+  "type": "library",
+  "license": "Apache-2.0",
+  "keywords": ["gRPC", "RPC", "protobuf", "multi server communication", "virion"],
+  "authors": [{"name": "ProTrixGamer"}],
+  "require": {
+    "php": ">=8.4",
+    "grpc/grpc": "^1.82"
+  },
+  "autoload": {
+    "psr-4": {"Trix\\pRPC\\": "src/Trix/pRPC/"}
+  },
+  "extra": {
+    "virion": {"spec": "3.1", "namespace-root": "Trix\\pRPC"}
+  }
+}
