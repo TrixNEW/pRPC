@@ -1,0 +1,11 @@
+*.txt
+*.phar
+
+# Common IDEs
+.idea/*
+!.idea/codeStyles/
+!.idea/fileTemplates/
+nbproject/*
+
+# Composer
+vendor/*
