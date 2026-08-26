@@ -59,7 +59,7 @@ Call it asynchronously:
 ```php
 $this->rpc->call($getPlayer, $request)
     ->then(function(GetPlayerResponse $response) : void{
-        // Runs on the PocketMine main thread.
+        // Runs on the main thread.
     })
     ->onError(function(Throwable $error) : void{
         // Timeout, overload, worker, gRPC, or decode failure.
