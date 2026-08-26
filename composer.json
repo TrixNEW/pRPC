@@ -1,18 +1,26 @@
 {
   "name": "trix/prpc",
-  "description": "High-performance gRPC library for Quark",
-  "type": "library",
+  "description": "High-performance asynchronous gRPC transport for PocketMine/Quark.",
   "license": "Apache-2.0",
-  "keywords": ["gRPC", "RPC", "protobuf", "multi server communication", "virion"],
-  "authors": [{"name": "ProTrixGamer"}],
+  "type": "library",
   "require": {
     "php": ">=8.4",
-    "grpc/grpc": "^1.82"
+    "ext-grpc": "*",
+    "grpc/grpc": "^1.82",
+    "google/protobuf": "^4.31 || ^5.0"
+  },
+  "suggest": {
+    "ext-protobuf": "Recommended for the fastest protobuf implementation."
   },
   "autoload": {
-    "psr-4": {"Trix\\pRPC\\": "src/Trix/pRPC/"}
+    "psr-4": {
+      "Trix\\pRPC\\": "Trix/pRPC/"
+    }
   },
   "extra": {
-    "virion": {"spec": "3.1", "namespace-root": "Trix\\pRPC"}
+    "virion": {
+      "spec": "3.0",
+      "namespace-root": "Trix\\pRPC"
+    }
   }
 }

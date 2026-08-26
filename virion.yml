@@ -1,0 +1,4 @@
+name: pRPC
+version: 1.0.0
+antigen: Trix\pRPC
+api: 5.0.0
