@@ -129,7 +129,7 @@ For a local/LAN database service, the defaults are intentionally latency-oriente
 
 ## Estimated Comparison with libasynql
 
-> **These are engineering estimates, not measured benchmark results.** They describe pRPC's intended architecture: a purpose-built data service with warm persistent connections, compact protobuf responses and optional caching or operation consolidation. Do not cite these ranges as measured benchmarks.
+> **These are engineering estimates, not measured benchmark results.** They describe pRPC's intended architecture: a purpose-built data service with warm persistent connections, compact protobuf responses and optional caching or operation consolidation. Do not cite these ranges as measured benchmarks. **(it's probably much faster then these benchmarks.. lol)**
 
 libasynql sends generic SQL jobs to PocketMine worker threads and returns generic result structures. pRPC sends a compact typed protobuf message to a dedicated service, where database access, validation, authorization, caching and multi-step operations can remain close to the data. This can substantially reduce PocketMine-side encoding, result hydration, cross-thread work and repeated round trips.
 
