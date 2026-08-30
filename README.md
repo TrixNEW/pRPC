@@ -19,6 +19,12 @@ Install PHP dependencies with Composer:
 composer install
 ```
 
+Run the regression suite with:
+
+```bash
+composer test
+```
+
 > `ext-grpc` must be installed in the PHP build used to run the server. pRPC is intended for unary request/response RPCs; long-lived server/bidi streams should use a separate dedicated stream transport.
 
 ## Quick Start
@@ -80,6 +86,8 @@ $this->rpc->call($getPlayer, $request, new RpcCallOptions(
 ));
 ```
 
+Metadata keys are case-insensitive and normalized to lowercase. Supplying keys that collide after normalization, such as `Authorization` and `authorization`, is rejected.
+
 Close the client when the plugin disables:
 
 ```php
@@ -113,10 +121,21 @@ $stats = $this->rpc->stats();
 - Worker selection avoids per-request cross-thread load polling.
 - Native + local deadlines prevent indefinitely pending RPCs.
 - Request, response and metadata sizes are bounded.
+- Configured request and response limits also cap the corresponding gRPC channel message limits, preventing larger channel overrides from bypassing allocation bounds.
 - Promise callback exceptions are isolated from unrelated RPC completions.
+- Worker result notifications are coalesced while results are waiting, reducing unnecessary main-thread wakeups.
 - Worker reconnects use exponential backoff.
 
 For a local/LAN database service, the defaults are intentionally latency-oriented. Start around **2–4 workers** and **batch size 4**, then benchmark against the real backend before increasing concurrency.
+
+## Production Checklist
+
+- Install and enable `ext-grpc`; enable `ext-protobuf` for the lowest protobuf overhead.
+- Use TLS or mTLS credentials for traffic that crosses an untrusted network.
+- Keep deadlines short and appropriate for the backend so shutdown and failure recovery remain bounded.
+- Set request, response, metadata and outstanding-call limits from measured production payloads and capacity.
+- Call `close()` when the plugin disables.
+- Run load and soak tests against the real PocketMine build and gRPC service before deployment.
 
 ## License
 
