@@ -117,7 +117,6 @@ $stats = $this->rpc->stats();
 - No network I/O on the PocketMine main thread.
 - Protobuf requests are encoded once and responses decoded once on the main thread.
 - Bounded `maxOutstanding` prevents unlimited queue growth during backend outages.
-- Result notifications are coalesced to reduce thread wakeup overhead.
 - Worker selection avoids per-request cross-thread load polling.
 - Native + local deadlines prevent indefinitely pending RPCs.
 - Request, response and metadata sizes are bounded.
@@ -127,6 +126,21 @@ $stats = $this->rpc->stats();
 - Worker reconnects use exponential backoff.
 
 For a local/LAN database service, the defaults are intentionally latency-oriented. Start around **2–4 workers** and **batch size 4**, then benchmark against the real backend before increasing concurrency.
+
+## Estimated Comparison with libasynql
+
+> **These are engineering estimates, not measured benchmark results.** libasynql executes SQL directly, while pRPC calls a separate gRPC service. Results depend primarily on network latency, query cost, service caching and how much work one RPC replaces. Do not cite these ranges as benchmarks.
+
+Assume PocketMine and the backend run on the same machine or low-latency LAN, connections are warm, protobuf payloads are under 1 KiB and the database is not saturated:
+
+| Workload | Expected pRPC result relative to libasynql | Why |
+| --- | --- | --- |
+| One trivial, uncached SQL query proxied unchanged | About **10–30% slower** (0.7–0.9x) | pRPC adds protobuf, gRPC and a service hop on top of the same database query. |
+| Cached read served by the RPC service | Roughly **2–4x faster** (100–300% higher effective operation rate) | The service can avoid the SQL round trip; this is a caching advantage, not an inherent transport advantage. |
+| One RPC replacing 3–10 dependent SQL operations | Roughly **1.5–3x faster** (50–200%) | Validation, transactions and intermediate work stay beside the database instead of crossing the PocketMine boundary repeatedly. |
+| High concurrency against the same saturated database | Usually **similar throughput** | Database capacity becomes the bottleneck; changing the asynchronous transport cannot create database capacity. |
+
+For a simple direct query, libasynql is the appropriate latency baseline and may be faster. pRPC is intended for service-oriented backends where one typed call can apply caching, authorization, validation, batching or multiple database operations. Publish concrete numbers only after running both libraries against the same schema, payloads, concurrency, hardware and backend state, reporting at least throughput plus p50, p95 and p99 latency.
 
 ## Production Checklist
 
