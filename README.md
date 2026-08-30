@@ -127,6 +127,36 @@ $stats = $this->rpc->stats();
 
 For a local/LAN database service, the defaults are intentionally latency-oriented. Start around **2–4 workers** and **batch size 4**, then benchmark against the real backend before increasing concurrency.
 
+## Benchmarks
+
+These burst tests use PocketMine runtime components, the pRPC client and a unary GetPlayer call against a gRPC backend on 127.0.0.1:50051. Measurements include request creation and protobuf encoding, worker queueing, gRPC request/response handling, protobuf response decoding and main-thread completion callbacks. Every measured call completed successfully.
+
+These are standalone transport benchmarks rather than a live gameplay-server test. Results vary with CPU, PHP build and extensions, payload size, backend work and network placement.
+
+### Standard burst tests
+
+| Calls | Workers | Batch | Total time | Throughput | Average latency | p95 | p99 | Errors |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 2 | 2 | 0.182 s | 5,492.1 RPS | 59.85 ms | 113.02 ms | 144.24 ms | 0 |
+| 5,000 | 4 | 4 | 0.367 s | 13,620.9 RPS | 209.74 ms | 253.95 ms | 287.06 ms | 0 |
+| 6,000 | 6 | 4 | 0.519 s | 11,549.3 RPS | 375.40 ms | 420.34 ms | 454.98 ms | 0 |
+
+The four-worker configuration delivered the best standard-run throughput at **13,620.9 completed calls per second**.
+
+### Extreme burst test
+
+All three runs used 20,000 calls, 6 workers and batch size 16.
+
+| Run | Total time | Throughput | Average latency | p95 | p99 | Errors |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.654 s | 30,567.8 RPS | 247.04 ms | 391.54 ms | 428.20 ms | 0 |
+| 2 | 0.681 s | 29,378.9 RPS | 260.99 ms | 412.10 ms | 444.61 ms | 0 |
+| 3 | 0.695 s | 28,767.1 RPS | 277.23 ms | 392.94 ms | 425.69 ms | 0 |
+
+Across the three extreme runs, pRPC averaged **29,571.3 RPS**, **261.75 ms average latency**, **398.86 ms p95** and **432.83 ms p99**, with **60,000 of 60,000 calls completed and zero errors**.
+
+The standard suite is in [tests/benchmark_prpc.php](tests/benchmark_prpc.php), and the stress suite is in [tests/test_extreme_rps.php](tests/test_extreme_rps.php).
+
 ## Production Checklist
 
 - Install and enable `ext-grpc`; enable `ext-protobuf` for the lowest protobuf overhead.
