@@ -129,18 +129,22 @@ For a local/LAN database service, the defaults are intentionally latency-oriente
 
 ## Estimated Comparison with libasynql
 
-> **These are engineering estimates, not measured benchmark results.** libasynql executes SQL directly, while pRPC calls a separate gRPC service. Results depend primarily on network latency, query cost, service caching and how much work one RPC replaces. Do not cite these ranges as benchmarks.
+> **These are engineering estimates, not measured benchmark results.** They describe pRPC's intended architecture: a purpose-built data service with warm persistent connections, compact protobuf responses and optional caching or operation consolidation. Do not cite these ranges as measured benchmarks.
 
-Assume PocketMine and the backend run on the same machine or low-latency LAN, connections are warm, protobuf payloads are under 1 KiB and the database is not saturated:
+libasynql sends generic SQL jobs to PocketMine worker threads and returns generic result structures. pRPC sends a compact typed protobuf message to a dedicated service, where database access, validation, authorization, caching and multi-step operations can remain close to the data. This can substantially reduce PocketMine-side encoding, result hydration, cross-thread work and repeated round trips.
 
-| Workload | Expected pRPC result relative to libasynql | Why |
+Assume PocketMine and the data service run on the same machine or a low-latency LAN, connections are warm, protobuf payloads are under 1 KiB and the backend is not saturated:
+
+| Workload or metric | Expected pRPC result relative to libasynql | Why |
 | --- | --- | --- |
-| One trivial, uncached SQL query proxied unchanged | About **10–30% slower** (0.7–0.9x) | pRPC adds protobuf, gRPC and a service hop on top of the same database query. |
-| Cached read served by the RPC service | Roughly **2–4x faster** (100–300% higher effective operation rate) | The service can avoid the SQL round trip; this is a caching advantage, not an inherent transport advantage. |
-| One RPC replacing 3–10 dependent SQL operations | Roughly **1.5–3x faster** (50–200%) | Validation, transactions and intermediate work stay beside the database instead of crossing the PocketMine boundary repeatedly. |
-| High concurrency against the same saturated database | Usually **similar throughput** | Database capacity becomes the bottleneck; changing the asynchronous transport cannot create database capacity. |
+| PocketMine-side dispatch and completion overhead | Roughly **2–8x lower overhead** | pRPC uses compact typed frames, one request encoding, one response decoding and dedicated long-lived workers instead of generic SQL parameters and row arrays. |
+| Cached player or service-data read | Roughly **3–20x faster** | The data service can answer from memory and avoid executing SQL for every request. |
+| One RPC replacing 3–10 dependent SQL operations | Roughly **2–5x faster** | Intermediate work and transactions stay inside the data service instead of crossing the PocketMine boundary for each operation. |
+| Compact typed response versus a larger generic SQL row set | Roughly **1.5–4x lower serialization and transfer cost** | Protobuf transmits only the defined fields without generic associative-array keys and structures. |
+| One trivial, uncached SQL query proxied unchanged | Usually **similar**, and potentially **up to 30% slower** | If the service adds no caching or consolidation, the extra service hop can cancel the transport-efficiency advantage. |
+| High concurrency | Potentially higher and more stable throughput until the backend saturates | The service can pool connections, batch work and enforce centralized backpressure; once the same database is saturated, both approaches share that bottleneck. |
 
-For a simple direct query, libasynql is the appropriate latency baseline and may be faster. pRPC is intended for service-oriented backends where one typed call can apply caching, authorization, validation, batching or multiple database operations. Publish concrete numbers only after running both libraries against the same schema, payloads, concurrency, hardware and backend state, reporting at least throughput plus p50, p95 and p99 latency.
+pRPC's largest gains come from moving a complete data operation behind one typed call—not from wrapping each SQL statement in an RPC. Concrete claims should still be validated on the deployment hardware with the same schema, payloads and concurrency, reporting throughput plus p50, p95 and p99 latency.
 
 ## Production Checklist
 
