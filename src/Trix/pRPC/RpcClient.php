@@ -173,8 +173,9 @@ final class RpcClient{
         if($timeoutMs > $this->config->maxTimeoutMs){
             throw new InvalidArgumentException("timeoutMs cannot exceed {$this->config->maxTimeoutMs} ms.");
         }
-        if($options->metadataBytes() > $this->config->maxMetadataBytes){
-            return $this->rejected(new RpcMessageTooLargeException('metadata', $options->metadataBytes(), $this->config->maxMetadataBytes));
+        $metadataBytes = $options->metadataBytes();
+        if($metadataBytes > $this->config->maxMetadataBytes){
+            return $this->rejected(new RpcMessageTooLargeException('metadata', $metadataBytes, $this->config->maxMetadataBytes));
         }
 
         $workerIndex = $this->selectWorker();
@@ -405,6 +406,11 @@ final class RpcClient{
 
             $this->failedWorkers[$index] = true;
             $this->workerStates[$index] = GrpcWorkerThread::STATE_FAILED;
+
+            foreach($worker->drainResults() as $payload){
+                $this->releaseTransportSlot($index);
+                $this->handleResult($payload);
+            }
 
             $lostSlots = $this->workerLoads[$index] ?? 0;
             $this->workerLoads[$index] = 0;

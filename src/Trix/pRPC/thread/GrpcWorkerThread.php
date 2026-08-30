@@ -127,6 +127,7 @@ final class GrpcWorkerThread extends Thread{
     protected function onRun() : void{
         $notifier = $this->sleeperEntry->createNotifier();
         $config = $this->decodeConfig($this->serializedConfig);
+        $this->serializedConfig = '';
         $client = null;
         $normalExit = false;
         $backoffMs = (int) $config['reconnectBackoffMinMs'];
@@ -358,11 +359,15 @@ final class GrpcWorkerThread extends Thread{
     }
 
     private function publish(string $payload, SleeperNotifier $notifier) : void{
-        $this->synchronized(function() use ($payload) : void{
+        $shouldWake = $this->synchronized(function() use ($payload) : bool{
+            $shouldWake = $this->results->count() === 0;
             $this->results[] = $payload;
             $this->outstanding = max(0, $this->outstanding - 1);
+            return $shouldWake;
         });
-        $notifier->wakeupSleeper();
+        if($shouldWake){
+            $notifier->wakeupSleeper();
+        }
     }
 
     private function decrementOutstanding() : void{

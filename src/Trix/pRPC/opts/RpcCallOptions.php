@@ -38,7 +38,11 @@ final readonly class RpcCallOptions{
                 }
                 $normalizedValues[] = $value;
             }
-            $normalized[strtolower($key)] = $normalizedValues;
+            $normalizedKey = strtolower($key);
+            if(isset($normalized[$normalizedKey])){
+                throw new InvalidArgumentException("Duplicate gRPC metadata key after case normalization: $key");
+            }
+            $normalized[$normalizedKey] = $normalizedValues;
         }
 
         $this->timeoutMs = $timeoutMs;

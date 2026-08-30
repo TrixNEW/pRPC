@@ -51,6 +51,9 @@ final readonly class RpcClientConfig{
         if($defaultTimeoutMs <= 0){
             throw new InvalidArgumentException('defaultTimeoutMs must be greater than 0.');
         }
+        if($maxTimeoutMs > intdiv(PHP_INT_MAX, 1_000_000)){
+            throw new InvalidArgumentException('maxTimeoutMs is too large for the monotonic deadline clock.');
+        }
         if($maxTimeoutMs < $defaultTimeoutMs){
             throw new InvalidArgumentException('maxTimeoutMs must be >= defaultTimeoutMs.');
         }
@@ -81,8 +84,8 @@ final readonly class RpcClientConfig{
         }
 
         self::validateThreadSafeValue($channelOptions, 'channelOptions');
-        $channelOptions['grpc.max_send_message_length'] ??= $maxRequestBytes;
-        $channelOptions['grpc.max_receive_message_length'] ??= $maxResponseBytes;
+        self::normalizeMessageLimit($channelOptions, 'grpc.max_send_message_length', $maxRequestBytes);
+        self::normalizeMessageLimit($channelOptions, 'grpc.max_receive_message_length', $maxResponseBytes);
 
         $this->credentials = $credentials ?? RpcCredentials::insecure();
         $this->methods = $normalizedMethods;
@@ -99,5 +102,14 @@ final readonly class RpcClientConfig{
         foreach($value as $key => $child){
             self::validateThreadSafeValue($child, $path . '[' . $key . ']');
         }
+    }
+
+    /** @param array<string, mixed> $channelOptions */
+    private static function normalizeMessageLimit(array &$channelOptions, string $key, int $configuredLimit) : void{
+        $value = $channelOptions[$key] ?? $configuredLimit;
+        if(!is_int($value) || $value < 1){
+            throw new InvalidArgumentException("channelOptions['$key'] must be a positive integer.");
+        }
+        $channelOptions[$key] = min($value, $configuredLimit);
     }
 }
