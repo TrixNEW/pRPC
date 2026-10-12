@@ -231,8 +231,7 @@ final class RpcClient{
     }
 
     /**
-     * Like call() but sends the same request again on retryable failures, with backoff.
-     * Retries reuse the request as given, so put the idempotency key inside it before calling.
+     * Retries resend this exact request, so put the idempotency key in it first.
      *
      * @template TRequest of Message
      * @template TResponse of Message
@@ -245,7 +244,6 @@ final class RpcClient{
         return $this->retrier->run(fn() => $this->call($method, $request, $options), $policy ?? new RpcRetryPolicy(), $onRetry);
     }
 
-    /** True once at least one worker has a connected channel. */
     public function isReady() : bool{
         if($this->closed){
             return false;
@@ -259,10 +257,7 @@ final class RpcClient{
         return false;
     }
 
-    /**
-     * Blocks the calling thread until every call and waiting retry settled or the timeout passed.
-     * Meant for startup and shutdown, where blocking is the point. Returns true when nothing is left.
-     */
+    /** Blocks the thread, so only use this at startup or shutdown. */
     public function drain(int $timeoutMs) : bool{
         $deadline = hrtime(true) + max(0, $timeoutMs) * 1_000_000;
         while(!$this->closed && ($this->pending !== [] || $this->retrier->waiting() > 0)){

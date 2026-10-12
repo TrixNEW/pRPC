@@ -1,35 +1,26 @@
 # pRPC
 
-Fast, asynchronous gRPC transport for **PocketMine-MP / Quark**, designed for low-latency database and network-service calls without blocking the server thread.
-
-pRPC uses dedicated worker threads, bounded backpressure, native gRPC deadlines, compact cross-thread frames, and a raw protobuf transport path to minimize allocations and duplicate serialization work.
+Asynchronous gRPC client for **PocketMine-MP / Quark**. Calls run on dedicated worker threads, so database and network-service calls never block the server thread.
 
 ## Requirements
 
-- **PHP 8.4+**
-- **PocketMine-MP / Quark API 5.x**
-- **ext-grpc**
+- PHP 8.4+
+- PocketMine-MP / Quark API 5.x
+- `ext-grpc`
 - `grpc/grpc ^1.82`
 - `google/protobuf ^4.31 || ^5.0`
-- **ext-protobuf** *(strongly recommended for best protobuf performance)*
-
-Install PHP dependencies with Composer:
+- `ext-protobuf` (recommended for performance)
 
 ```bash
 composer install
-```
-
-Run the regression suite with:
-
-```bash
 composer test
 ```
 
-> `ext-grpc` must be installed in the PHP build used to run the server. pRPC is intended for unary request/response RPCs; long-lived server/bidi streams should use a separate dedicated stream transport.
+pRPC handles unary calls only. Long-lived server or bidirectional streams need a separate transport.
 
-## Quick Start
+## Usage
 
-Define the RPC methods your service exposes:
+Define the methods your service exposes:
 
 ```php
 use Trix\pRPC\RpcMethod;
@@ -45,8 +36,8 @@ Create one shared client for your plugin:
 
 ```php
 use Trix\pRPC\RpcClient;
-use Trix\pRPC\RpcClientConfig;
-use Trix\pRPC\RpcCredentials;
+use Trix\pRPC\opts\RpcClientConfig;
+use Trix\pRPC\opts\RpcCredentials;
 
 $this->rpc = new RpcClient($this, new RpcClientConfig(
     endpoint: '127.0.0.1:50051',
@@ -60,59 +51,30 @@ $this->rpc = new RpcClient($this, new RpcClientConfig(
 ));
 ```
 
-Call it asynchronously:
+Make a call. Callbacks run on the main thread:
 
 ```php
 $this->rpc->call($getPlayer, $request)
     ->then(function(GetPlayerResponse $response) : void{
-        // Runs on the main thread.
+        // ...
     })
     ->onError(function(Throwable $error) : void{
-        // Timeout, overload, worker, gRPC, or decode failure.
+        // timeout, overload, worker, gRPC or decode failure
     });
 ```
 
-Optional per-call timeout and metadata:
+Per-call timeout and metadata:
 
 ```php
-use Trix\pRPC\RpcCallOptions;
+use Trix\pRPC\opts\RpcCallOptions;
 
 $this->rpc->call($getPlayer, $request, new RpcCallOptions(
     timeoutMs: 1000,
-    metadata: [
-        'server-id' => 'factions-1',
-        'authorization' => 'Bearer secret'
-    ]
+    metadata: ['server-id' => 'factions-1']
 ));
 ```
 
-Metadata keys are case-insensitive and normalized to lowercase. Supplying keys that collide after normalization, such as `Authorization` and `authorization`, is rejected.
-
-Retry a call on transient failures with exponential backoff and jitter:
-
-```php
-use Trix\pRPC\retry\RpcRetryPolicy;
-use Trix\pRPC\retry\RpcStatus;
-
-$this->rpc->callRetrying($transfer, $request, new RpcRetryPolicy(maxAttempts: 5, baseDelayMs: 100))
-    ->onError(function(Throwable $error) : void{
-        if(RpcStatus::isAmbiguous($error)){
-            // The server may have applied it. Keep the request and its id for a later retry.
-        }
-    });
-```
-
-The same request object is sent on every attempt, so put the idempotency key inside it. Timeouts and
-`UNAVAILABLE` are ambiguous: the server may already have applied the request. Set
-`retryAmbiguous: false` for requests the server does not deduplicate.
-
-| Helper | |
-| --- | --- |
-| `RpcStatus::isRetryable($e)` | sending again can succeed (overload, timeout, `UNAVAILABLE`, `RESOURCE_EXHAUSTED`, `ABORTED`) |
-| `RpcStatus::isAmbiguous($e)` | the request may have been applied |
-| `RpcStatus::notSent($e)` | rejected locally before sending |
-| `$rpc->isReady()` | at least one worker has a connected channel |
-| `$rpc->drain($timeoutMs)` | blocks until every call and waiting retry settled, for startup and shutdown |
+Metadata keys are lowercased, and keys that collide after lowercasing are rejected.
 
 Close the client when the plugin disables:
 
@@ -120,78 +82,77 @@ Close the client when the plugin disables:
 $this->rpc->close();
 ```
 
+### Retries
+
+```php
+use Trix\pRPC\retry\RpcRetryPolicy;
+
+$this->rpc->callRetrying($method, $request, new RpcRetryPolicy(maxAttempts: 5, baseDelayMs: 100));
+```
+
+Retries use exponential backoff with jitter and resend the same request object, so put any idempotency key inside it.
+
+Timeouts and `UNAVAILABLE` are ambiguous because the server may already have applied the request. They are only retried with `retryAmbiguous: true`, which should only be set when the server deduplicates requests. `INTERNAL`, `UNKNOWN` and `CANCELLED` are also ambiguous but usually final, so they get at most `maxUncertainAttempts` tries.
+
+`RpcStatus` classifies a failure:
+
+| Method | True when |
+| --- | --- |
+| `isRetryable($e)` | Sending again can succeed |
+| `isAmbiguous($e)` | The server may have applied the request |
+| `notSent($e)` | The call was rejected before it was sent |
+
+### Startup and shutdown
+
+`isReady()` returns true once a worker has a connected channel. `drain($timeoutMs)` blocks until every call and waiting retry has settled, so only use it at startup or shutdown.
+
 ## API
 
 | Class | Purpose |
 | --- | --- |
-| `RpcClient` | Dispatches asynchronous unary calls and manages workers |
+| `RpcClient` | Dispatches calls and manages workers |
 | `RpcClientConfig` | Endpoint, workers, timeouts, limits and channel options |
-| `RpcMethod` | Maps a gRPC path to request/response protobuf classes |
+| `RpcMethod` | Maps a gRPC path to its request and response classes |
 | `RpcCallOptions` | Per-call timeout and metadata |
-| `RpcCredentials` | Insecure, TLS or mTLS channel credentials |
+| `RpcCredentials` | Insecure, TLS or mTLS credentials |
 | `RpcPromise` | `then()`, `onError()` and `always()` callbacks |
-| `RpcClientStats` | Pending calls, transport load, worker states and waiting retries |
 | `RpcRetryPolicy` | Attempts, backoff and jitter for `callRetrying()` |
+| `RpcStatus` | Failure classification |
+| `RpcClientStats` | Pending calls, transport load, worker states and waiting retries, from `$rpc->stats()` |
 
-Runtime stats are available through:
+## Design
 
-```php
-$stats = $this->rpc->stats();
-```
+- No network I/O on the main thread.
+- Requests are encoded once and responses decoded once, on the main thread.
+- `maxOutstanding` bounds the queue during backend outages.
+- Native and local deadlines keep calls from pending forever.
+- Request, response and metadata sizes are bounded, and those limits also cap the channel's message limits.
+- A throwing callback never affects other calls.
+- Worker wakeups are coalesced and reconnects back off exponentially.
 
-## Performance & Safety
-
-- No network I/O on the PocketMine main thread.
-- Protobuf requests are encoded once and responses decoded once on the main thread.
-- Bounded `maxOutstanding` prevents unlimited queue growth during backend outages.
-- Worker selection avoids per-request cross-thread load polling.
-- Native + local deadlines prevent indefinitely pending RPCs.
-- Request, response and metadata sizes are bounded.
-- Configured request and response limits also cap the corresponding gRPC channel message limits, preventing larger channel overrides from bypassing allocation bounds.
-- Promise callback exceptions are isolated from unrelated RPC completions.
-- Worker result notifications are coalesced while results are waiting, reducing unnecessary main-thread wakeups.
-- Worker reconnects use exponential backoff.
-
-For a local/LAN database service, the defaults are intentionally latency-oriented. Start around **2–4 workers** and **batch size 4**, then benchmark against the real backend before increasing concurrency.
+For a local or LAN service, start with 2 to 4 workers and batch size 4, then benchmark against the real backend before raising them.
 
 ## Benchmarks
 
-These burst tests use PocketMine runtime components, the pRPC client and a unary GetPlayer call against a gRPC backend on 127.0.0.1:50051. Measurements include request creation and protobuf encoding, worker queueing, gRPC request/response handling, protobuf response decoding and main-thread completion callbacks. Every measured call completed successfully.
+Unary GetPlayer calls against a gRPC backend on 127.0.0.1, measured from request creation to the main-thread callback. Every call succeeded. Results depend on CPU, PHP build, payload size and backend work.
 
-These are standalone transport benchmarks rather than a live gameplay-server test. Results vary with CPU, PHP build and extensions, payload size, backend work and network placement.
+| Calls | Workers | Batch | Time | Throughput | Avg latency | p95 | p99 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 2 | 2 | 0.182 s | 5,492 RPS | 59.85 ms | 113.02 ms | 144.24 ms |
+| 5,000 | 4 | 4 | 0.367 s | 13,621 RPS | 209.74 ms | 253.95 ms | 287.06 ms |
+| 6,000 | 6 | 4 | 0.519 s | 11,549 RPS | 375.40 ms | 420.34 ms | 454.98 ms |
+| 20,000 | 6 | 16 | 0.677 s | 29,571 RPS | 261.75 ms | 398.86 ms | 432.83 ms |
 
-### Standard burst tests
+The 20,000 call row is the average of three runs. See [tests/benchmark_prpc.php](tests/benchmark_prpc.php) and [tests/test_extreme_rps.php](tests/test_extreme_rps.php).
 
-| Calls | Workers | Batch | Total time | Throughput | Average latency | p95 | p99 | Errors |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1,000 | 2 | 2 | 0.182 s | 5,492.1 RPS | 59.85 ms | 113.02 ms | 144.24 ms | 0 |
-| 5,000 | 4 | 4 | 0.367 s | 13,620.9 RPS | 209.74 ms | 253.95 ms | 287.06 ms | 0 |
-| 6,000 | 6 | 4 | 0.519 s | 11,549.3 RPS | 375.40 ms | 420.34 ms | 454.98 ms | 0 |
+## Production checklist
 
-The four-worker configuration delivered the best standard-run throughput at **13,620.9 completed calls per second**.
-
-### Extreme burst test
-
-All three runs used 20,000 calls, 6 workers and batch size 16.
-
-| Run | Total time | Throughput | Average latency | p95 | p99 | Errors |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 0.654 s | 30,567.8 RPS | 247.04 ms | 391.54 ms | 428.20 ms | 0 |
-| 2 | 0.681 s | 29,378.9 RPS | 260.99 ms | 412.10 ms | 444.61 ms | 0 |
-| 3 | 0.695 s | 28,767.1 RPS | 277.23 ms | 392.94 ms | 425.69 ms | 0 |
-
-Across the three extreme runs, pRPC averaged **29,571.3 RPS**, **261.75 ms average latency**, **398.86 ms p95** and **432.83 ms p99**, with **60,000 of 60,000 calls completed and zero errors**.
-
-The standard suite is in [tests/benchmark_prpc.php](tests/benchmark_prpc.php), and the stress suite is in [tests/test_extreme_rps.php](tests/test_extreme_rps.php).
-
-## Production Checklist
-
-- Install and enable `ext-grpc`; enable `ext-protobuf` for the lowest protobuf overhead.
-- Use TLS or mTLS credentials for traffic that crosses an untrusted network.
-- Keep deadlines short and appropriate for the backend so shutdown and failure recovery remain bounded.
-- Set request, response, metadata and outstanding-call limits from measured production payloads and capacity.
+- Enable `ext-grpc`, and `ext-protobuf` for the lowest overhead.
+- Use TLS or mTLS for traffic over an untrusted network.
+- Keep deadlines short so shutdown and failure recovery stay bounded.
+- Size the request, response, metadata and outstanding limits from real payloads.
 - Call `close()` when the plugin disables.
-- Run load and soak tests against the real PocketMine build and gRPC service before deployment.
+- Load test against the real server and backend before deploying.
 
 ## License
 

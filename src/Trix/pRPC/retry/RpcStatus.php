@@ -12,9 +12,6 @@ use Trix\pRPC\utils\exception\RpcOverloadedException;
 use Trix\pRPC\utils\exception\RpcTimeoutException;
 use Trix\pRPC\utils\exception\RpcWorkerException;
 
-/**
- * Sorts call failures into the three cases a caller has to handle differently.
- */
 final class RpcStatus{
     public const int OK = 0;
     public const int CANCELLED = 1;
@@ -40,12 +37,10 @@ final class RpcStatus{
         return $e instanceof RpcException ? $e->getStatusCode() : self::UNKNOWN;
     }
 
-    /** The request never left this process, so it cannot have been applied. */
     public static function notSent(Throwable $e) : bool{
         return $e instanceof RpcOverloadedException || $e instanceof RpcMessageTooLargeException;
     }
 
-    /** The server may or may not have applied the request. */
     public static function isAmbiguous(Throwable $e) : bool{
         if(self::notSent($e)){
             return false;
@@ -59,7 +54,6 @@ final class RpcStatus{
         };
     }
 
-    /** Sending the same request again can succeed. Ambiguous failures need a deduplicated request. */
     public static function isRetryable(Throwable $e) : bool{
         if($e instanceof RpcMessageTooLargeException){
             return false;

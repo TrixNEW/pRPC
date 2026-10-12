@@ -166,7 +166,7 @@ $test('retrier resends transient failures after the delay and resolves once', st
     $retries = [];
     $r->run(
         $attempts([new RpcTimeoutException(5), new RpcException('down', RpcStatus::UNAVAILABLE), 'ok'], $calls),
-        new RpcRetryPolicy(maxAttempts: 5, baseDelayMs: 10, maxDelayMs: 100, jitter: 0.0),
+        new RpcRetryPolicy(maxAttempts: 5, baseDelayMs: 10, maxDelayMs: 100, retryAmbiguous: true, jitter: 0.0),
         static function(Throwable $e, int $n) use (&$retries) : void{ $retries[] = $n; }
     )->then(static function(string $v) use (&$result) : void{ $result = $v; });
     if($calls !== 1 || $r->waiting() !== 1){
@@ -210,6 +210,47 @@ $test('retrier stops on final errors, attempt limit and ambiguous failures when 
         ->onError(static function(Throwable $e) use (&$error) : void{ $error = $e; });
     if($calls !== 1 || !$error instanceof RpcTimeoutException){
         throw new RuntimeException('Ambiguous failure was retried.');
+    }
+});
+
+$test('retrier gives ambiguous final codes a few tries and never retries a closed client', static function() use ($retrier, $attempts) : void{
+    [$r, $advance] = $retrier();
+    $calls = 0;
+    $result = null;
+    $policy = new RpcRetryPolicy(maxAttempts: 10, baseDelayMs: 1, maxDelayMs: 1, retryAmbiguous: true, jitter: 0.0);
+    $r->run($attempts([new RpcException('reset', RpcStatus::INTERNAL), new RpcTimeoutException(1), 'ok'], $calls), $policy)
+        ->then(static function(string $v) use (&$result) : void{ $result = $v; });
+    $advance(1);
+    $advance(1);
+    if($calls !== 3 || $result !== 'ok'){
+        throw new RuntimeException("Ambiguous INTERNAL was not retried: calls=$calls");
+    }
+
+    $calls = 0;
+    $error = null;
+    $r->run($attempts(array_fill(0, 10, new RpcException('bad', RpcStatus::INTERNAL)), $calls), $policy)
+        ->onError(static function(Throwable $e) use (&$error) : void{ $error = $e; });
+    for($i = 0; $i < 10; ++$i){
+        $advance(1);
+    }
+    if($calls !== 3 || $error === null){
+        throw new RuntimeException("Uncertain attempt limit ignored: calls=$calls");
+    }
+
+    $calls = 0;
+    $error = null;
+    $r->run($attempts([new RpcException('reset', RpcStatus::INTERNAL), 'ok'], $calls), new RpcRetryPolicy())
+        ->onError(static function(Throwable $e) use (&$error) : void{ $error = $e; });
+    if($calls !== 1 || $error === null){
+        throw new RuntimeException('Default policy retried an ambiguous failure.');
+    }
+
+    $calls = 0;
+    $error = null;
+    $r->run($attempts([new RpcClosedException(), 'ok'], $calls), $policy)
+        ->onError(static function(Throwable $e) use (&$error) : void{ $error = $e; });
+    if($calls !== 1 || !$error instanceof RpcClosedException){
+        throw new RuntimeException('Closed client was retried.');
     }
 });
 

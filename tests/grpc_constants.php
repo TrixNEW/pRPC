@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-// Status constants for running the unit tests without ext-grpc.
+// stand-ins so the tests run without ext-grpc
 namespace Grpc;
 
 if(!\extension_loaded('grpc')){
