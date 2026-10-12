@@ -94,7 +94,7 @@ Retry a call on transient failures with exponential backoff and jitter:
 use Trix\pRPC\retry\RpcRetryPolicy;
 use Trix\pRPC\retry\RpcStatus;
 
-$this->rpc->callRetrying($transfer, $request, new RpcRetryPolicy(maxAttempts: 5, baseDelayMs: 100))
+$this->rpc->callRetrying($transfer, $request, new RpcRetryPolicy(maxAttempts: 5, baseDelayMs: 100, retryAmbiguous: true))
     ->onError(function(Throwable $error) : void{
         if(RpcStatus::isAmbiguous($error)){
             // The server may have applied it. Keep the request and its id for a later retry.
@@ -103,8 +103,9 @@ $this->rpc->callRetrying($transfer, $request, new RpcRetryPolicy(maxAttempts: 5,
 ```
 
 The same request object is sent on every attempt, so put the idempotency key inside it. Timeouts and
-`UNAVAILABLE` are ambiguous: the server may already have applied the request. Set
-`retryAmbiguous: false` for requests the server does not deduplicate.
+`UNAVAILABLE` are ambiguous: the server may already have applied the request, so they are only retried
+with `retryAmbiguous: true`. Only set it for requests the server deduplicates. `INTERNAL`, `UNKNOWN` and
+`CANCELLED` are ambiguous too but usually final, so they get at most `maxUncertainAttempts` tries.
 
 | Helper | |
 | --- | --- |

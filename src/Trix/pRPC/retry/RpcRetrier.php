@@ -6,6 +6,7 @@ namespace Trix\pRPC\retry;
 
 use Closure;
 use Throwable;
+use Trix\pRPC\utils\exception\RpcClosedException;
 use Trix\pRPC\utils\promise\RpcPromise;
 use Trix\pRPC\utils\promise\RpcPromiseResolver;
 
@@ -38,12 +39,12 @@ final class RpcRetrier{
      */
     public function run(Closure $attempt, RpcRetryPolicy $policy, ?Closure $onRetry = null) : RpcPromise{
         $resolver = new RpcPromiseResolver($this->callbackErrorHandler);
-        $this->attempt($attempt, $policy, $onRetry, $resolver, 1);
+        $this->attempt($attempt, $policy, $onRetry, $resolver, 1, 0);
         return $resolver->promise();
     }
 
     /** @param RpcPromiseResolver<mixed> $resolver */
-    private function attempt(Closure $attempt, RpcRetryPolicy $policy, ?Closure $onRetry, RpcPromiseResolver $resolver, int $n) : void{
+    private function attempt(Closure $attempt, RpcRetryPolicy $policy, ?Closure $onRetry, RpcPromiseResolver $resolver, int $n, int $uncertain) : void{
         try{
             $promise = $attempt();
         }catch(Throwable $e){
@@ -52,11 +53,17 @@ final class RpcRetrier{
         }
         $promise
             ->then(static fn(mixed $value) => $resolver->resolve($value))
-            ->onError(function(Throwable $e) use ($attempt, $policy, $onRetry, $resolver, $n) : void{
+            ->onError(function(Throwable $e) use ($attempt, $policy, $onRetry, $resolver, $n, $uncertain) : void{
+                $ambiguous = RpcStatus::isAmbiguous($e);
+                // ambiguous but usually final, like a reset stream, so a deduplicated request gets a few more tries
+                $uncertainRetry = $ambiguous && !RpcStatus::isRetryable($e) && !$e instanceof RpcClosedException;
+                if($uncertainRetry){
+                    ++$uncertain;
+                }
                 $retry = !$this->stopped
                     && $n < $policy->maxAttempts
-                    && RpcStatus::isRetryable($e)
-                    && ($policy->retryAmbiguous || !RpcStatus::isAmbiguous($e));
+                    && ($policy->retryAmbiguous || !$ambiguous)
+                    && ($uncertainRetry ? $uncertain < $policy->maxUncertainAttempts : RpcStatus::isRetryable($e));
                 if(!$retry){
                     $resolver->reject($e);
                     return;
@@ -70,7 +77,7 @@ final class RpcRetrier{
                 }
                 $this->timers[$this->nextTimer++] = [
                     'dueNs' => ($this->clockNs)() + $policy->delayMs($n) * 1_000_000,
-                    'run' => fn() => $this->attempt($attempt, $policy, $onRetry, $resolver, $n + 1),
+                    'run' => fn() => $this->attempt($attempt, $policy, $onRetry, $resolver, $n + 1, $uncertain),
                 ];
             });
     }
