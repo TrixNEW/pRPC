@@ -88,6 +88,32 @@ $this->rpc->call($getPlayer, $request, new RpcCallOptions(
 
 Metadata keys are case-insensitive and normalized to lowercase. Supplying keys that collide after normalization, such as `Authorization` and `authorization`, is rejected.
 
+Retry a call on transient failures with exponential backoff and jitter:
+
+```php
+use Trix\pRPC\retry\RpcRetryPolicy;
+use Trix\pRPC\retry\RpcStatus;
+
+$this->rpc->callRetrying($transfer, $request, new RpcRetryPolicy(maxAttempts: 5, baseDelayMs: 100))
+    ->onError(function(Throwable $error) : void{
+        if(RpcStatus::isAmbiguous($error)){
+            // The server may have applied it. Keep the request and its id for a later retry.
+        }
+    });
+```
+
+The same request object is sent on every attempt, so put the idempotency key inside it. Timeouts and
+`UNAVAILABLE` are ambiguous: the server may already have applied the request. Set
+`retryAmbiguous: false` for requests the server does not deduplicate.
+
+| Helper | |
+| --- | --- |
+| `RpcStatus::isRetryable($e)` | sending again can succeed (overload, timeout, `UNAVAILABLE`, `RESOURCE_EXHAUSTED`, `ABORTED`) |
+| `RpcStatus::isAmbiguous($e)` | the request may have been applied |
+| `RpcStatus::notSent($e)` | rejected locally before sending |
+| `$rpc->isReady()` | at least one worker has a connected channel |
+| `$rpc->drain($timeoutMs)` | blocks until every call and waiting retry settled, for startup and shutdown |
+
 Close the client when the plugin disables:
 
 ```php
@@ -104,7 +130,8 @@ $this->rpc->close();
 | `RpcCallOptions` | Per-call timeout and metadata |
 | `RpcCredentials` | Insecure, TLS or mTLS channel credentials |
 | `RpcPromise` | `then()`, `onError()` and `always()` callbacks |
-| `RpcClientStats` | Pending calls, transport load and worker states |
+| `RpcClientStats` | Pending calls, transport load, worker states and waiting retries |
+| `RpcRetryPolicy` | Attempts, backoff and jitter for `callRetrying()` |
 
 Runtime stats are available through:
 

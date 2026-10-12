@@ -13,6 +13,7 @@ final readonly class RpcClientStats{
         public int $pending,
         public int $transportOutstanding,
         public array $workerLoads,
-        public array $workerStates
+        public array $workerStates,
+        public int $retrying = 0
     ){}
 }
