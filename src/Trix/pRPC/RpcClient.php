@@ -16,6 +16,8 @@ use RuntimeException;
 use Throwable;
 use Trix\pRPC\opts\RpcCallOptions;
 use Trix\pRPC\opts\RpcClientConfig;
+use Trix\pRPC\retry\RpcRetrier;
+use Trix\pRPC\retry\RpcRetryPolicy;
 use Trix\pRPC\stats\RpcClientStats;
 use Trix\pRPC\thread\GrpcWorkerThread;
 use Trix\pRPC\utils\exception\RpcClosedException;
@@ -69,6 +71,8 @@ final class RpcClient{
     /** @var Closure(Throwable): void */
     private Closure $callbackErrorHandler;
 
+    private readonly RpcRetrier $retrier;
+
     /**
      * @throws Throwable
      */
@@ -77,6 +81,7 @@ final class RpcClient{
         $this->callbackErrorHandler = static function(Throwable $e) : void{
             \GlobalLogger::get()->logException($e);
         };
+        $this->retrier = new RpcRetrier($this->callbackErrorHandler, static fn() : int => hrtime(true));
 
         $methodPaths = [];
         foreach($config->methods as $id => $method){
@@ -225,6 +230,49 @@ final class RpcClient{
         return $resolver->promise();
     }
 
+    /**
+     * Retries resend this exact request, so put the idempotency key in it first.
+     *
+     * @template TRequest of Message
+     * @template TResponse of Message
+     * @param RpcMethod<TRequest, TResponse> $method
+     * @param TRequest $request
+     * @param ?Closure(Throwable, int): void $onRetry
+     * @return RpcPromise<TResponse>
+     */
+    public function callRetrying(RpcMethod $method, Message $request, ?RpcRetryPolicy $policy = null, ?RpcCallOptions $options = null, ?Closure $onRetry = null) : RpcPromise{
+        return $this->retrier->run(fn() => $this->call($method, $request, $options), $policy ?? new RpcRetryPolicy(), $onRetry);
+    }
+
+    public function isReady() : bool{
+        if($this->closed){
+            return false;
+        }
+        $this->refreshWorkerStates();
+        foreach($this->workerStates as $index => $state){
+            if($state === GrpcWorkerThread::STATE_READY && !isset($this->failedWorkers[$index])){
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Blocks the thread, so only use this at startup or shutdown. */
+    public function drain(int $timeoutMs) : bool{
+        $deadline = hrtime(true) + max(0, $timeoutMs) * 1_000_000;
+        while(!$this->closed && ($this->pending !== [] || $this->retrier->waiting() > 0)){
+            $this->tick();
+            if($this->pending === [] && $this->retrier->waiting() === 0){
+                break;
+            }
+            if(hrtime(true) >= $deadline){
+                return false;
+            }
+            usleep(200);
+        }
+        return $this->pending === [] && $this->retrier->waiting() === 0;
+    }
+
     public function pendingCount() : int{
         return count($this->pending);
     }
@@ -243,7 +291,8 @@ final class RpcClient{
             count($this->pending),
             $this->transportOutstanding,
             $this->workerLoads,
-            array_map(GrpcWorkerThread::stateName(...), $this->workerStates)
+            array_map(GrpcWorkerThread::stateName(...), $this->workerStates),
+            $this->retrier->waiting()
         );
     }
 
@@ -265,6 +314,7 @@ final class RpcClient{
         $this->closed = true;
         $this->timeoutTask?->cancel();
         $this->timeoutTask = null;
+        $this->retrier->stop();
 
         foreach($this->workers as $worker){
             $worker->requestStop();
@@ -305,6 +355,7 @@ final class RpcClient{
     private function tick() : void{
         $this->drainResults();
         $this->expireDeadlines();
+        $this->retrier->tick();
         $this->refreshWorkerStates();
         $this->detectWorkerFailures();
     }

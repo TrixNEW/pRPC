@@ -3,11 +3,21 @@
 declare(strict_types=1);
 
 require dirname(__DIR__) . '/vendor/autoload.php';
+require __DIR__ . '/grpc_constants.php';
 
 use Google\Protobuf\Internal\Message;
 use Trix\pRPC\opts\RpcCallOptions;
 use Trix\pRPC\opts\RpcClientConfig;
 use Trix\pRPC\RpcMethod;
+use Trix\pRPC\retry\RpcRetrier;
+use Trix\pRPC\retry\RpcRetryPolicy;
+use Trix\pRPC\retry\RpcStatus;
+use Trix\pRPC\utils\exception\RpcClosedException;
+use Trix\pRPC\utils\exception\RpcException;
+use Trix\pRPC\utils\exception\RpcMessageTooLargeException;
+use Trix\pRPC\utils\exception\RpcOverloadedException;
+use Trix\pRPC\utils\exception\RpcTimeoutException;
+use Trix\pRPC\utils\promise\RpcPromise;
 use Trix\pRPC\utils\promise\RpcPromiseResolver;
 
 final class TestMessage extends Message{}
@@ -96,6 +106,163 @@ $test('callback exceptions are isolated', static function() : void{
     $resolver->resolve('ok');
     if($errors !== ['callback failed'] || !$alwaysRan){
         throw new RuntimeException('Callback failure was not isolated.');
+    }
+});
+
+$test('failures are classified by whether a retry is safe', static function() : void{
+    $cases = [
+        [new RpcOverloadedException(10), true, false],
+        [new RpcMessageTooLargeException('request', 10, 5), false, false],
+        [new RpcTimeoutException(100), true, true],
+        [new RpcClosedException(), false, true],
+        [new RpcException('down', RpcStatus::UNAVAILABLE), true, true],
+        [new RpcException('busy', RpcStatus::RESOURCE_EXHAUSTED), true, false],
+        [new RpcException('rule', RpcStatus::FAILED_PRECONDITION), false, false],
+        [new RpcException('bad', RpcStatus::INVALID_ARGUMENT), false, false],
+        [new RuntimeException('other'), false, true],
+    ];
+    foreach($cases as [$e, $retryable, $ambiguous]){
+        if(RpcStatus::isRetryable($e) !== $retryable || RpcStatus::isAmbiguous($e) !== $ambiguous){
+            throw new RuntimeException('Wrong classification for ' . $e::class . ': ' . $e->getMessage());
+        }
+    }
+});
+
+$test('retry delays grow, cap and stay inside the jitter band', static function() : void{
+    $p = new RpcRetryPolicy(maxAttempts: 10, baseDelayMs: 100, maxDelayMs: 1_000, jitter: 0.2);
+    if($p->delayMs(1, 0.5) !== 100 || $p->delayMs(2, 0.5) !== 200 || $p->delayMs(5, 0.5) !== 1_000 || $p->delayMs(40, 0.5) !== 1_000){
+        throw new RuntimeException('Unexpected backoff.');
+    }
+    if($p->delayMs(1, 0.0) !== 80 || $p->delayMs(1, 1.0) !== 120 || $p->delayMs(5, 1.0) !== 1_000){
+        throw new RuntimeException('Unexpected jitter.');
+    }
+});
+
+/** @return array{RpcRetrier, Closure(int): void} */
+$retrier = static function() : array{
+    $now = 0;
+    $r = new RpcRetrier(static function(Throwable $e) : void{ throw $e; }, static function() use (&$now) : int{ return $now; });
+    return [$r, static function(int $ms) use (&$now, $r) : void{ $now += $ms * 1_000_000; $r->tick(); }];
+};
+
+$attempts = static function(array $outcomes, int &$calls) : Closure{
+    return static function() use (&$outcomes, &$calls) : RpcPromise{
+        ++$calls;
+        $resolver = new RpcPromiseResolver(static function(Throwable $e) : void{ throw $e; });
+        $next = array_shift($outcomes);
+        if($next instanceof Throwable){
+            $resolver->reject($next);
+        }else{
+            $resolver->resolve($next);
+        }
+        return $resolver->promise();
+    };
+};
+
+$test('retrier resends transient failures after the delay and resolves once', static function() use ($retrier, $attempts) : void{
+    [$r, $advance] = $retrier();
+    $calls = 0;
+    $result = null;
+    $retries = [];
+    $r->run(
+        $attempts([new RpcTimeoutException(5), new RpcException('down', RpcStatus::UNAVAILABLE), 'ok'], $calls),
+        new RpcRetryPolicy(maxAttempts: 5, baseDelayMs: 10, maxDelayMs: 100, retryAmbiguous: true, jitter: 0.0),
+        static function(Throwable $e, int $n) use (&$retries) : void{ $retries[] = $n; }
+    )->then(static function(string $v) use (&$result) : void{ $result = $v; });
+    if($calls !== 1 || $r->waiting() !== 1){
+        throw new RuntimeException('First retry was not scheduled.');
+    }
+    $advance(9);
+    if($calls !== 1){
+        throw new RuntimeException('Retry ran before its delay.');
+    }
+    $advance(1);
+    $advance(20);
+    if($calls !== 3 || $result !== 'ok' || $retries !== [1, 2] || $r->waiting() !== 0){
+        throw new RuntimeException("Unexpected retry run: calls=$calls");
+    }
+});
+
+$test('retrier stops on final errors, attempt limit and ambiguous failures when not allowed', static function() use ($retrier, $attempts) : void{
+    [$r, $advance] = $retrier();
+    $calls = 0;
+    $error = null;
+    $r->run($attempts([new RpcException('rule', RpcStatus::FAILED_PRECONDITION)], $calls), new RpcRetryPolicy())
+        ->onError(static function(Throwable $e) use (&$error) : void{ $error = $e; });
+    if($calls !== 1 || $error === null || $r->waiting() !== 0){
+        throw new RuntimeException('Final error was retried.');
+    }
+
+    $calls = 0;
+    $error = null;
+    $r->run($attempts(array_fill(0, 5, new RpcOverloadedException(1)), $calls), new RpcRetryPolicy(maxAttempts: 3, baseDelayMs: 1, maxDelayMs: 1, jitter: 0.0))
+        ->onError(static function(Throwable $e) use (&$error) : void{ $error = $e; });
+    $advance(1);
+    $advance(1);
+    $advance(1);
+    if($calls !== 3 || !$error instanceof RpcOverloadedException){
+        throw new RuntimeException("Attempt limit ignored: calls=$calls");
+    }
+
+    $calls = 0;
+    $error = null;
+    $r->run($attempts([new RpcTimeoutException(1), 'ok'], $calls), new RpcRetryPolicy(retryAmbiguous: false))
+        ->onError(static function(Throwable $e) use (&$error) : void{ $error = $e; });
+    if($calls !== 1 || !$error instanceof RpcTimeoutException){
+        throw new RuntimeException('Ambiguous failure was retried.');
+    }
+});
+
+$test('retrier gives ambiguous final codes a few tries and never retries a closed client', static function() use ($retrier, $attempts) : void{
+    [$r, $advance] = $retrier();
+    $calls = 0;
+    $result = null;
+    $policy = new RpcRetryPolicy(maxAttempts: 10, baseDelayMs: 1, maxDelayMs: 1, retryAmbiguous: true, jitter: 0.0);
+    $r->run($attempts([new RpcException('reset', RpcStatus::INTERNAL), new RpcTimeoutException(1), 'ok'], $calls), $policy)
+        ->then(static function(string $v) use (&$result) : void{ $result = $v; });
+    $advance(1);
+    $advance(1);
+    if($calls !== 3 || $result !== 'ok'){
+        throw new RuntimeException("Ambiguous INTERNAL was not retried: calls=$calls");
+    }
+
+    $calls = 0;
+    $error = null;
+    $r->run($attempts(array_fill(0, 10, new RpcException('bad', RpcStatus::INTERNAL)), $calls), $policy)
+        ->onError(static function(Throwable $e) use (&$error) : void{ $error = $e; });
+    for($i = 0; $i < 10; ++$i){
+        $advance(1);
+    }
+    if($calls !== 3 || $error === null){
+        throw new RuntimeException("Uncertain attempt limit ignored: calls=$calls");
+    }
+
+    $calls = 0;
+    $error = null;
+    $r->run($attempts([new RpcException('reset', RpcStatus::INTERNAL), 'ok'], $calls), new RpcRetryPolicy())
+        ->onError(static function(Throwable $e) use (&$error) : void{ $error = $e; });
+    if($calls !== 1 || $error === null){
+        throw new RuntimeException('Default policy retried an ambiguous failure.');
+    }
+
+    $calls = 0;
+    $error = null;
+    $r->run($attempts([new RpcClosedException(), 'ok'], $calls), $policy)
+        ->onError(static function(Throwable $e) use (&$error) : void{ $error = $e; });
+    if($calls !== 1 || !$error instanceof RpcClosedException){
+        throw new RuntimeException('Closed client was retried.');
+    }
+});
+
+$test('stopping the retrier runs waiting retries immediately', static function() use ($retrier, $attempts) : void{
+    [$r] = $retrier();
+    $calls = 0;
+    $error = null;
+    $r->run($attempts([new RpcOverloadedException(1), new RpcClosedException()], $calls), new RpcRetryPolicy(baseDelayMs: 1_000, maxDelayMs: 1_000))
+        ->onError(static function(Throwable $e) use (&$error) : void{ $error = $e; });
+    $r->stop();
+    if($calls !== 2 || !$error instanceof RpcClosedException || $r->waiting() !== 0){
+        throw new RuntimeException('Stop did not settle waiting retries.');
     }
 });
 
