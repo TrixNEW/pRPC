@@ -19,6 +19,9 @@ final readonly class RpcClientConfig{
     /**
      * @param list<RpcMethod> $methods
      * @param array<string, mixed> $channelOptions Scalar/null/nested-array values only.
+     * @param int $workers Worker threads for a standalone client, at most 6. With RpcClientManager it caps how many
+     *                     of the shared workers this endpoint may hold at once.
+     * @param int $maxQueuedBytes Bounds the request bytes queued or in flight, alongside maxOutstanding.
      */
     public function __construct(
         public string $endpoint,
@@ -34,7 +37,8 @@ final readonly class RpcClientConfig{
         public int $maxResponseBytes = 4_194_304,
         public int $maxMetadataBytes = 32_768,
         public int $reconnectBackoffMinMs = 100,
-        public int $reconnectBackoffMaxMs = 5_000
+        public int $reconnectBackoffMaxMs = 5_000,
+        public int $maxQueuedBytes = 16_777_216
     ){
         if($endpoint === ''){
             throw new InvalidArgumentException('endpoint cannot be empty.');
@@ -60,7 +64,7 @@ final readonly class RpcClientConfig{
         if($maxOutstanding < 1){
             throw new InvalidArgumentException('maxOutstanding must be greater than 0.');
         }
-        if($maxRequestBytes < 1 || $maxResponseBytes < 1 || $maxMetadataBytes < 1){
+        if($maxRequestBytes < 1 || $maxResponseBytes < 1 || $maxMetadataBytes < 1 || $maxQueuedBytes < 1){
             throw new InvalidArgumentException('Message and metadata byte limits must be greater than 0.');
         }
         if($reconnectBackoffMinMs < 1 || $reconnectBackoffMaxMs < $reconnectBackoffMinMs){
@@ -86,6 +90,9 @@ final readonly class RpcClientConfig{
         self::validateThreadSafeValue($channelOptions, 'channelOptions');
         self::normalizeMessageLimit($channelOptions, 'grpc.max_send_message_length', $maxRequestBytes);
         self::normalizeMessageLimit($channelOptions, 'grpc.max_receive_message_length', $maxResponseBytes);
+        // gRPC waits up to 120s between reconnects by default, far too long after a backend restart
+        $channelOptions['grpc.initial_reconnect_backoff_ms'] ??= $reconnectBackoffMinMs;
+        $channelOptions['grpc.max_reconnect_backoff_ms'] ??= $reconnectBackoffMaxMs;
 
         $this->credentials = $credentials ?? RpcCredentials::insecure();
         $this->methods = $normalizedMethods;
