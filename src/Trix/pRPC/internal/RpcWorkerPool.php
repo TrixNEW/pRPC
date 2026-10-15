@@ -31,9 +31,15 @@ final class RpcWorkerPool{
     // gRPC enforces each call's deadline, so a worker this far past its latest one is never coming back
     private const int STUCK_GRACE_NS = 2_000_000_000;
     private const int WATCHDOG_EVERY_TICKS = 10;
+    private const int STOP_WAIT_NS = 500_000_000;
 
     private static int $liveThreads = 0;
-    /** @var list<GrpcWorkerThread> busy workers left to finish their call after their pool closed */
+    /**
+     * Workers that are dead, hung, or still finishing a call after their pool closed. A thread tears down its objects
+     * only when joined, so they're joined later once nothing else of theirs is running, never mid traffic.
+     *
+     * @var list<GrpcWorkerThread>
+     */
     private static array $detached = [];
 
     private readonly SleeperHandler $sleeper;
@@ -231,16 +237,10 @@ final class RpcWorkerPool{
             if($failed){
                 $lastError = $worker->getLastError();
                 $reason = "gRPC worker $workerId terminated unexpectedly." . ($lastError !== '' ? ' Last error: ' . $lastError : '');
-                try{
-                    $worker->join();
-                }catch(Throwable){
-                }
-                ThreadManager::getInstance()->remove($worker);
             }else{
-                // never join it, it would block forever
                 $reason = "gRPC worker $workerId stopped responding inside a call and was replaced.";
-                self::$detached[] = $worker;
             }
+            self::$detached[] = $worker;
             \GlobalLogger::get()->warning('pRPC: ' . $reason);
             if($snapshot['endpoint'] >= 0){
                 ($this->clients[$snapshot['endpoint']] ?? null)?->onTransportLost($snapshot['ids'], $reason);
@@ -258,7 +258,9 @@ final class RpcWorkerPool{
 
     private function spawn() : void{
         $worker = new GrpcWorkerThread($this->queue, $this->sleeperEntry ?? throw new RuntimeException('No sleeper entry.'), $this->nextWorkerId++);
+        $this->queue->addWorker();
         if(!$worker->start()){
+            $this->queue->abandon($worker);
             throw new RuntimeException("Failed to start gRPC worker {$worker->workerId}.");
         }
         $this->workers[$worker->workerId] = $worker;
@@ -300,8 +302,24 @@ final class RpcWorkerPool{
         }
         $this->clients = [];
 
+        // let every idle worker leave its loop before joining any, so none is still using the queue while another
+        // tears down, busy ones are left to finish their call in the background
+        $idle = [];
         foreach($this->workers as $worker){
             if($worker->snapshot()['endpoint'] >= 0){
+                self::$detached[] = $worker;
+            }else{
+                $idle[] = $worker;
+            }
+        }
+        $stopBy = hrtime(true) + self::STOP_WAIT_NS;
+        foreach($idle as $worker){
+            while($worker->isRunning() && hrtime(true) < $stopBy){
+                usleep(200);
+            }
+        }
+        foreach($idle as $worker){
+            if($worker->isRunning()){
                 self::$detached[] = $worker;
                 continue;
             }
@@ -326,7 +344,7 @@ final class RpcWorkerPool{
 
     private static function reapDetached() : void{
         foreach(self::$detached as $i => $worker){
-            if($worker->isTerminated()){
+            if(!$worker->isRunning()){
                 try{
                     $worker->quit();
                 }catch(Throwable){

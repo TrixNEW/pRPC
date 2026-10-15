@@ -40,7 +40,12 @@ class UnaryCall{
     public function wait() : array{
         $m = $this->stub->model;
         if($m['mode'] === 'crash'){
-            exit(1);
+            // an uncatchable fatal, like a real crash
+            ini_set('memory_limit', '16M');
+            $grow = [];
+            while(true){
+                $grow[] = str_repeat('x', 1 << 20);
+            }
         }
         if($m['mode'] === 'hang'){
             // what a call stuck on the wrong completion queue looks like, it ignores its deadline

@@ -10,6 +10,8 @@ use pmmp\thread\ThreadSafeArray;
 /**
  * Shared by the main thread and every worker of a pool. Workers pull a batch from one endpoint at a time,
  * so a call never waits behind a busy worker and a slow endpoint can only hold its lane's cap of workers.
+ * The last idle worker is kept for endpoints that have none yet, so every endpoint gets a worker while fewer
+ * endpoints are busy than there are workers.
  *
  * @internal
  */
@@ -21,6 +23,8 @@ final class RpcDispatchQueue extends ThreadSafe{
     /** @var ThreadSafeArray<int, string> */
     public readonly ThreadSafeArray $results;
     private int $cursor = 0;
+    private int $workers = 0;
+    private int $busy = 0;
     private bool $stopping = false;
     private int $epoch = 0;
 
@@ -28,6 +32,12 @@ final class RpcDispatchQueue extends ThreadSafe{
         $this->lanes = new ThreadSafeArray();
         $this->abandoned = new ThreadSafeArray();
         $this->results = new ThreadSafeArray();
+    }
+
+    public function addWorker() : void{
+        $this->synchronized(function() : void{
+            ++$this->workers;
+        });
     }
 
     public function addLane(int $endpointId, RpcLane $lane) : void{
@@ -108,8 +118,9 @@ final class RpcDispatchQueue extends ThreadSafe{
                     return null;
                 }
                 $eligible = [];
+                $reserve = $this->lanes->count() > 1 && $this->workers - $this->busy < 2;
                 foreach($this->lanes as $id => $lane){
-                    if($lane->busy < $lane->cap && $lane->jobs->count() > 0){
+                    if($lane->busy < $lane->cap && ($lane->busy === 0 || !$reserve) && $lane->jobs->count() > 0){
                         $eligible[] = $id;
                     }
                 }
@@ -124,6 +135,7 @@ final class RpcDispatchQueue extends ThreadSafe{
                     $lane = $this->lanes[$pick];
                     $jobs = $lane->jobs->chunk($lane->batchSize);
                     ++$lane->busy;
+                    ++$this->busy;
                     $this->cursor = $pick;
                     $ids = '';
                     $untilNs = 0;
@@ -156,6 +168,7 @@ final class RpcDispatchQueue extends ThreadSafe{
                 return false;
             }
             $worker->markIdle();
+            --$this->busy;
             $lane = $this->lanes[$endpointId] ?? null;
             if($lane !== null){
                 --$lane->busy;
@@ -182,9 +195,11 @@ final class RpcDispatchQueue extends ThreadSafe{
         return $this->synchronized(function() use ($worker) : bool{
             $endpointId = $worker->busyEndpoint();
             $this->abandoned[$worker->workerId] = true;
+            --$this->workers;
             if($endpointId < 0){
                 return false;
             }
+            --$this->busy;
             $lane = $this->lanes[$endpointId] ?? null;
             if($lane !== null){
                 --$lane->busy;
@@ -214,9 +229,5 @@ final class RpcDispatchQueue extends ThreadSafe{
             }
             return $dropped;
         });
-    }
-
-    public function isStopping() : bool{
-        return $this->synchronized(fn() : bool => $this->stopping);
     }
 }
