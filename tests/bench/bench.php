@@ -19,7 +19,7 @@ $host = getenv('PRPC_HOST') ?: '127.0.0.1';
 $target = static function(int $port, string $fakeSpec) use ($fake, $host) : string{
     return $fake ? 'fake:' . $fakeSpec : "$host:$port";
 };
-// for the real backend: examples/backend serves ok on 50051+, slow on 50100, blackhole on 50101, down = nothing on 50199
+// for the real backend: examples/backend serves ok on 50051+, slow on 50100, blackhole on 50101, flapping on 50102, down = nothing on 50199
 $ep = static fn(string $name, string $target, float $perTick, int $timeoutMs = 1_500) : array => compact('name', 'target', 'perTick', 'timeoutMs');
 
 $scenarios = [
@@ -40,7 +40,7 @@ $scenarios = [
     ]],
     'flap' => ['duration' => 6, 'tickWorkMs' => 5, 'endpoints' => [
         $ep('fast', $target(50051, 'lat=500'), 5),
-        $ep('flap', $target(50052, 'lat=500,mode=flap,flap=500'), 5),
+        $ep('flap', $target(50102, 'lat=500,mode=flap,flap=500'), 5),
     ]],
 ];
 foreach([2, 4, 8, 16] as $n){
@@ -89,12 +89,11 @@ for($rep = 1; $rep <= $reps; ++$rep){
     // the old isReady() flips once a worker made its stub, the new one once the channel reports READY
     $readyBy = hrtime(true) + 5_000_000_000;
     Bench::loop(static function() use ($clients, $readyBy) : bool{
+        $ready = true;
         foreach($clients as $c){
-            if(!$c->isReady()){
-                return hrtime(true) < $readyBy;
-            }
+            $ready = $c->isReady() && $ready;
         }
-        return false;
+        return !$ready && hrtime(true) < $readyBy;
     });
     $startupMs = (hrtime(true) - $startNs) / 1e6;
 
@@ -102,11 +101,14 @@ for($rep = 1; $rep <= $reps; ++$rep){
     $errors = [];
     $sent = 0;
     $done = 0;
-    $send = static function(string $name, RpcClient $c) use ($method, &$lat, &$errors, &$sent, &$done) : void{
+    $callNs = 0;
+    $send = static function(string $name, RpcClient $c) use ($method, &$lat, &$errors, &$sent, &$done, &$callNs) : void{
         $req = new StringValue(['value' => str_repeat('x', 64)]);
         $t = hrtime(true);
         ++$sent;
-        $c->call($method, $req)->then(static function() use ($name, $t, &$lat, &$done) : void{
+        $promise = $c->call($method, $req);
+        $callNs += hrtime(true) - $t;
+        $promise->then(static function() use ($name, $t, &$lat, &$done) : void{
             $lat[$name][] = (hrtime(true) - $t) / 1e6;
             ++$done;
         })->onError(static function(Throwable $e) use ($name, &$errors, &$done) : void{
@@ -116,6 +118,8 @@ for($rep = 1; $rep <= $reps; ++$rep){
         });
     };
 
+    Bench::$sleeper->resetNotificationProcessingTime();
+    Bench::$heartbeatNs = 0;
     $mainCpu = Bench::threadCpuMs();
     $procCpu = Bench::processCpuMs();
     $runNs = hrtime(true);
@@ -165,10 +169,12 @@ for($rep = 1; $rep <= $reps; ++$rep){
     $closeMs = (hrtime(true) - $closeNs) / 1e6;
 
     $row = [
-        'scenario' => $name, 'arch' => $arch, 'src' => basename(dirname(getenv('PRPC_SRC') ?: 'repo/x', 3)), 'rep' => $rep,
+        'scenario' => $name, 'arch' => $arch, 'src' => getenv('PRPC_SRC') === false ? 'new' : basename(dirname(getenv('PRPC_SRC'), 3)), 'rep' => $rep,
         'threads' => $threads, 'startupMs' => round($startupMs, 1), 'closeMs' => round($closeMs, 1),
         'sent' => $sent, 'rps' => $runS > 0 ? round(($sent > 0 ? $sent : 0) / $runS) : 0,
-        'mainCpuMs' => round($mainCpu), 'procCpuMs' => round($procCpu), 'seconds' => round($runS, 2),
+        'mainCpuMs' => round($mainCpu),
+        // wall time the main thread spent in call(), handling results and the tick task, callbacks included
+        'mainPrpcMs' => round(($callNs + Bench::$sleeper->getNotificationProcessingTime() + Bench::$heartbeatNs) / 1e6, 1), 'procCpuMs' => round($procCpu), 'seconds' => round($runS, 2),
         'rssMb' => [round($rssBefore, 1), round($rssAfter, 1)], 'errors' => $errors,
     ];
     foreach($lat as $epName => $values){

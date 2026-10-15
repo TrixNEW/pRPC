@@ -67,7 +67,10 @@ final class RpcDispatchQueue extends ThreadSafe{
                 return false;
             }
             $lane->jobs[] = $job;
-            $this->notifyOne();
+            // a woken worker takes a whole batch, so one wakeup per batch is enough
+            if(($lane->jobs->count() - 1) % $lane->batchSize === 0){
+                $this->notifyOne();
+            }
             return true;
         });
     }

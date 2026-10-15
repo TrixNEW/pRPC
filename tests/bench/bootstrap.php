@@ -43,6 +43,7 @@ final class Bench{
     public static TaskScheduler $scheduler;
     public static PluginBase $plugin;
     private static int $tick = 0;
+    public static int $heartbeatNs = 0;
 
     public static function boot(ThreadSafeClassLoader $loader) : void{
         self::$sleeper = new TimeTrackingSleeperHandler(new TimingsHandler('pRPC bench'));
@@ -73,7 +74,9 @@ final class Bench{
         while($next < $end){
             self::$sleeper->sleepUntil($next);
             ++self::$tick;
+            $t = hrtime(true);
             self::$scheduler->mainThreadHeartbeat(self::$tick);
+            self::$heartbeatNs += hrtime(true) - $t;
             if(!$onTick(self::$tick)){
                 return;
             }
