@@ -45,7 +45,6 @@ final class GrpcWorkerThread extends Thread{
     private int $busyEndpoint = -1;
     private int $busyUntilNs = 0;
     private string $inflight = '';
-    private int $calls = 0;
 
     public function __construct(
         private readonly RpcDispatchQueue $queue,
@@ -74,14 +73,13 @@ final class GrpcWorkerThread extends Thread{
         return $this->busyEndpoint;
     }
 
-    /** @return array{endpoint: int, untilNs: int, ids: list<int>, state: int, calls: int} */
+    /** @return array{endpoint: int, untilNs: int, ids: list<int>, state: int} */
     public function snapshot() : array{
         return $this->synchronized(fn() : array => [
             'endpoint' => $this->busyEndpoint,
             'untilNs' => $this->busyUntilNs,
             'ids' => $this->inflight === '' ? [] : array_values(unpack('J*', $this->inflight)),
             'state' => $this->state,
-            'calls' => $this->calls,
         ]);
     }
 
@@ -270,9 +268,6 @@ final class GrpcWorkerThread extends Thread{
             }
         }
 
-        $this->synchronized(function() use ($calls) : void{
-            $this->calls += count($calls);
-        });
         try{
             return [isset($stubs[$endpointId]) ? $stubs[$endpointId]->getConnectivityState(false) : self::CONNECTIVITY_TRANSIENT_FAILURE, $probed];
         }catch(Throwable){

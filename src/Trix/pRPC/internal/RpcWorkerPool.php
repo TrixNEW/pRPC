@@ -62,8 +62,7 @@ final class RpcWorkerPool{
         PluginBase $plugin,
         public readonly int $size,
         public readonly int $maxOutstanding,
-        public readonly int $maxQueuedBytes,
-        private readonly int $tickInterval = 1
+        public readonly int $maxQueuedBytes
     ){
         if($size < 1 || $size > self::MAX_WORKERS){
             throw new InvalidArgumentException('A worker pool needs between 1 and ' . self::MAX_WORKERS . ' workers.');
@@ -86,7 +85,7 @@ final class RpcWorkerPool{
             }
             $this->task = $plugin->getScheduler()->scheduleRepeatingTask(new ClosureTask(function() : void{
                 $this->pump(++$this->ticks % self::WATCHDOG_EVERY_TICKS === 0);
-            }), $tickInterval);
+            }), 1);
         }catch(Throwable $e){
             $this->closed = true;
             $this->queue->stop();
@@ -122,15 +121,11 @@ final class RpcWorkerPool{
         return $this->queue->removeLane($endpointId);
     }
 
-    public function hasClients() : bool{
-        return $this->clients !== [];
-    }
-
     public function isFull(int $bytes) : ?string{
         if($this->outstanding >= $this->maxOutstanding){
             return 'request';
         }
-        if($this->outstandingBytes + $bytes > $this->maxQueuedBytes){
+        if($this->outstanding > 0 && $this->outstandingBytes + $bytes > $this->maxQueuedBytes){
             return 'byte';
         }
         return null;
@@ -169,10 +164,6 @@ final class RpcWorkerPool{
 
     public function lostWorkers() : int{
         return $this->lostWorkers;
-    }
-
-    public function outstanding() : int{
-        return $this->outstanding;
     }
 
     /** @return array{list<int>, list<string>} calls in each worker's current batch, and each worker's state */

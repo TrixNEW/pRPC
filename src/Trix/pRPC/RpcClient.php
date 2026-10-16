@@ -167,7 +167,8 @@ final class RpcClient{
             return $this->rejected(new RpcMessageTooLargeException('request', $requestBytes, $this->config->maxRequestBytes));
         }
         $jobBytes = $requestBytes + strlen($options->packedMetadata) + GrpcWorkerThread::JOB_HEADER_BYTES;
-        if($this->transportBytes + $jobBytes > $this->config->maxQueuedBytes){
+        // one request bigger than the byte budget still goes through on its own, or it could never be sent
+        if($this->transport !== [] && $this->transportBytes + $jobBytes > $this->config->maxQueuedBytes){
             ++$this->overloaded;
             return $this->rejected(new RpcOverloadedException($this->config->maxQueuedBytes, 'byte'));
         }

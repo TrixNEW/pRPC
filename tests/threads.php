@@ -247,6 +247,14 @@ $tests['queue limits reject predictably'] = static function() use ($config, $sen
     $check(($log->err['RpcOverloadedException:8'] ?? 0) > 0 && $client->stats()->queuedBytes <= 400, 'byte limit: ' . json_encode($log->err));
     $until(static fn() : bool => $settled($log));
     $client->close();
+
+    // a single request over the byte budget still goes through when nothing else is queued
+    $client = Open::add(new RpcClient(Bench::$plugin, $config('lat=100', ['maxQueuedBytes' => 64])));
+    $log = $newLog();
+    $send($client, str_repeat('x', 200), $log);
+    $until(static fn() : bool => $settled($log));
+    $check($log->ok === 1, 'oversized lone request: ' . json_encode($log->err));
+    $client->close();
 };
 
 $tests['requests time out in the queue and in flight, and their slots come back'] = static function() use ($config, $send, $newLog, $settled, $until, $check, $exactlyOnce) : void{
