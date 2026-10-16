@@ -15,6 +15,7 @@ final class RpcRetrier{
     /** @var array<int, array{dueNs: int, run: Closure(): void}> */
     private array $timers = [];
     private int $nextTimer = 0;
+    private int $retries = 0;
     private bool $stopped = false;
 
     /**
@@ -34,12 +35,13 @@ final class RpcRetrier{
      */
     public function run(Closure $attempt, RpcRetryPolicy $policy, ?Closure $onRetry = null) : RpcPromise{
         $resolver = new RpcPromiseResolver($this->callbackErrorHandler);
-        $this->attempt($attempt, $policy, $onRetry, $resolver, 1, 0);
+        $giveUpNs = $policy->totalTimeoutMs === null ? PHP_INT_MAX : ($this->clockNs)() + $policy->totalTimeoutMs * 1_000_000;
+        $this->attempt($attempt, $policy, $onRetry, $resolver, 1, 0, $giveUpNs);
         return $resolver->promise();
     }
 
     /** @param RpcPromiseResolver<mixed> $resolver */
-    private function attempt(Closure $attempt, RpcRetryPolicy $policy, ?Closure $onRetry, RpcPromiseResolver $resolver, int $n, int $uncertain) : void{
+    private function attempt(Closure $attempt, RpcRetryPolicy $policy, ?Closure $onRetry, RpcPromiseResolver $resolver, int $n, int $uncertain, int $giveUpNs) : void{
         try{
             $promise = $attempt();
         }catch(Throwable $e){
@@ -48,7 +50,7 @@ final class RpcRetrier{
         }
         $promise
             ->then(static fn(mixed $value) => $resolver->resolve($value))
-            ->onError(function(Throwable $e) use ($attempt, $policy, $onRetry, $resolver, $n, $uncertain) : void{
+            ->onError(function(Throwable $e) use ($attempt, $policy, $onRetry, $resolver, $n, $uncertain, $giveUpNs) : void{
                 $ambiguous = RpcStatus::isAmbiguous($e);
                 // usually final, so these only get a few extra tries
                 $uncertainRetry = $ambiguous && !RpcStatus::isRetryable($e) && !$e instanceof RpcClosedException;
@@ -59,10 +61,12 @@ final class RpcRetrier{
                     && $n < $policy->maxAttempts
                     && ($policy->retryAmbiguous || !$ambiguous)
                     && ($uncertainRetry ? $uncertain < $policy->maxUncertainAttempts : RpcStatus::isRetryable($e));
-                if(!$retry){
+                $dueNs = $retry ? ($this->clockNs)() + $policy->delayMs($n) * 1_000_000 : 0;
+                if(!$retry || $dueNs > $giveUpNs){
                     $resolver->reject($e);
                     return;
                 }
+                ++$this->retries;
                 if($onRetry !== null){
                     try{
                         $onRetry($e, $n);
@@ -71,8 +75,8 @@ final class RpcRetrier{
                     }
                 }
                 $this->timers[$this->nextTimer++] = [
-                    'dueNs' => ($this->clockNs)() + $policy->delayMs($n) * 1_000_000,
-                    'run' => fn() => $this->attempt($attempt, $policy, $onRetry, $resolver, $n + 1, $uncertain),
+                    'dueNs' => $dueNs,
+                    'run' => fn() => $this->attempt($attempt, $policy, $onRetry, $resolver, $n + 1, $uncertain, $giveUpNs),
                 ];
             });
     }
@@ -93,6 +97,10 @@ final class RpcRetrier{
 
     public function waiting() : int{
         return count($this->timers);
+    }
+
+    public function retries() : int{
+        return $this->retries;
     }
 
     public function stop() : void{

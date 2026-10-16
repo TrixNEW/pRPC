@@ -7,6 +7,7 @@ namespace Trix\pRPC\retry;
 use InvalidArgumentException;
 
 // only turn on retryAmbiguous when the server dedupes requests, or a retry can apply twice
+// totalTimeoutMs stops scheduling retries once the next one would start past that budget, counted from the first attempt
 final readonly class RpcRetryPolicy{
     public function __construct(
         public int $maxAttempts = 5,
@@ -14,13 +15,17 @@ final readonly class RpcRetryPolicy{
         public int $maxDelayMs = 5_000,
         public bool $retryAmbiguous = false,
         public float $jitter = 0.2,
-        public int $maxUncertainAttempts = 3
+        public int $maxUncertainAttempts = 3,
+        public ?int $totalTimeoutMs = null
     ){
         if($maxAttempts < 1 || $maxUncertainAttempts < 1){
             throw new InvalidArgumentException('maxAttempts and maxUncertainAttempts must be at least 1.');
         }
         if($baseDelayMs < 1 || $maxDelayMs < $baseDelayMs){
             throw new InvalidArgumentException('Invalid retry delay range.');
+        }
+        if($totalTimeoutMs !== null && $totalTimeoutMs < 1){
+            throw new InvalidArgumentException('totalTimeoutMs must be greater than 0.');
         }
         if($jitter < 0.0 || $jitter > 1.0){
             throw new InvalidArgumentException('jitter must be between 0 and 1.');

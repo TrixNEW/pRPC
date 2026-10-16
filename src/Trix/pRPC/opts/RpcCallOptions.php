@@ -12,6 +12,10 @@ final readonly class RpcCallOptions{
     /** @var array<string, list<string>> */
     public array $metadata;
 
+    /** @internal metadata as the worker reads it, encoded once per options object */
+    public string $packedMetadata;
+    private int $metadataBytes;
+
     /**
      * @param array<string, string|list<string>> $metadata
      */
@@ -45,19 +49,28 @@ final readonly class RpcCallOptions{
             $normalized[$normalizedKey] = $normalizedValues;
         }
 
-        $this->timeoutMs = $timeoutMs;
-        $this->metadata = $normalized;
-    }
-
-    /** @internal */
-    public function metadataBytes() : int{
         $bytes = 0;
-        foreach($this->metadata as $key => $values){
+        foreach($normalized as $key => $values){
             $bytes += strlen($key);
             foreach($values as $value){
                 $bytes += strlen($value);
             }
         }
-        return $bytes;
+
+        $this->timeoutMs = $timeoutMs;
+        $this->metadata = $normalized;
+        $this->metadataBytes = $bytes;
+        $this->packedMetadata = $normalized === [] ? '' : serialize($normalized);
+    }
+
+    /** @internal */
+    public static function none() : self{
+        static $none = null;
+        return $none ??= new self();
+    }
+
+    /** @internal */
+    public function metadataBytes() : int{
+        return $this->metadataBytes;
     }
 }

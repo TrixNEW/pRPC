@@ -10,10 +10,10 @@ use Example\Data\SavePlayerRequest;
 use Example\Data\SavePlayerResponse;
 use pocketmine\plugin\PluginBase;
 use Throwable;
-use Trix\pRPC\RpcCallOptions;
+use Trix\pRPC\opts\RpcCallOptions;
+use Trix\pRPC\opts\RpcClientConfig;
+use Trix\pRPC\opts\RpcCredentials;
 use Trix\pRPC\RpcClient;
-use Trix\pRPC\RpcClientConfig;
-use Trix\pRPC\RpcCredentials;
 use Trix\pRPC\RpcMethod;
 
 final class Main extends PluginBase{
