@@ -251,7 +251,7 @@ final class GrpcWorkerThread extends Thread{
         }
 
         if($parsed !== []){
-            GrpcGate::enter($this->gate, $this->gateKey);
+            GrpcGate::enter($this->gate, $this->gateKey, count($parsed) > 1);
             try{
                 $this->markRunning(max($untilNs, hrtime(true)));
                 if(count($parsed) === 1){
@@ -282,21 +282,22 @@ final class GrpcWorkerThread extends Thread{
      */
     private function runSingle(int $endpointId, array $config, array $job, Channel $channel, array &$channels, ThreadSafeArray $results, SleeperNotifier $notifier) : void{
         [$id, $deadlineNs, $queuedNs, $methodId, $metadata, $requestData] = $job;
+        // built first so nothing but the batch call runs between creating the call and waiting on it
+        $ops = [
+            OP_SEND_INITIAL_METADATA => $metadata,
+            OP_SEND_MESSAGE => ['message' => $requestData],
+            OP_SEND_CLOSE_FROM_CLIENT => true,
+            OP_RECV_INITIAL_METADATA => true,
+            OP_RECV_MESSAGE => true,
+            OP_RECV_STATUS_ON_CLIENT => true,
+        ];
+        $startedNs = hrtime(true);
         $call = $this->createCall($endpointId, $config, $channel, $id, $deadlineNs, $queuedNs, $methodId, $results, $notifier);
         if($call === null){
             return;
         }
-        GrpcGate::closeWindow($this->gate, $this->gateKey);
-        $startedNs = hrtime(true);
         try{
-            $event = $call->startBatch([
-                OP_SEND_INITIAL_METADATA => $metadata,
-                OP_SEND_MESSAGE => ['message' => $requestData],
-                OP_SEND_CLOSE_FROM_CLIENT => true,
-                OP_RECV_INITIAL_METADATA => true,
-                OP_RECV_MESSAGE => true,
-                OP_RECV_STATUS_ON_CLIENT => true,
-            ]);
+            $event = $call->startBatch($ops);
         }catch(Throwable $e){
             $this->callFailed($endpointId, $channels, $id, $queuedNs, $startedNs, $e, $results, $notifier);
             return;

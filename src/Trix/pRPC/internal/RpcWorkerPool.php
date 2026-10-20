@@ -280,8 +280,8 @@ final class RpcWorkerPool{
     }
 
     /**
-     * Starts the workers still owed once no call anywhere in the process is in flight, since a new thread replaces
-     * ext-grpc's completion queue under any running call.
+     * Starts the workers still owed once GrpcGate says it's safe, since a new thread replaces ext-grpc's completion
+     * queue under any call that isn't waiting on it yet.
      */
     private function spawnPending() : bool{
         if($this->pendingSpawns === 0){

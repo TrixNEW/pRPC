@@ -9,8 +9,8 @@ use pmmp\thread\ThreadSafeArray;
 /**
  * Guards ext-grpc's process wide completion queue. It allows at most 6 waiters, so at most 6 workers may be inside a
  * call across every pool. Starting a thread replaces the queue, and a call created on the old one then waits forever,
- * so threads only start while no worker is between creating a call and waiting on it. It lives in $GLOBALS so every
- * shaded copy of pRPC in the server shares it.
+ * so pRPC only starts threads while no worker is between creating a call and waiting on it. Threads started by
+ * anything else can't be held back. It lives in $GLOBALS so every shaded copy of pRPC in the server shares it.
  *
  * @internal
  */
@@ -20,7 +20,7 @@ final class GrpcGate{
     // how long a spawn may hold calls back before it gives up and lets them through for a while
     private const int PAUSE_NS = 3_000_000_000;
     private const int RETRY_NS = 1_000_000_000;
-    // a worker that just closed its window is microseconds from waiting, this covers it being descheduled
+    // a worker that entered without a window is microseconds from waiting, this covers it being descheduled
     private const int SETTLE_NS = 25_000_000;
 
     private const int IN_CALL = 1;
@@ -55,12 +55,13 @@ final class GrpcGate{
     }
 
     /**
-     * Takes a call slot and opens the worker's window, waiting while 6 are taken or a spawn is pending.
+     * Takes a call slot, waiting while 6 are taken or a spawn is pending. A worker that runs one call per slot is
+     * waiting on the queue microseconds later, so only one that creates several calls first needs a window.
      *
      * @param ThreadSafeArray<string, mixed> $gate
      */
-    public static function enter(ThreadSafeArray $gate, int $key) : void{
-        $gate->synchronized(static function() use ($gate, $key) : void{
+    public static function enter(ThreadSafeArray $gate, int $key, bool $window) : void{
+        $gate->synchronized(static function() use ($gate, $key, $window) : void{
             while(true){
                 $pausedFor = $gate['pausedBy'] === 0 ? 0 : $gate['pauseUntil'] - hrtime(true);
                 if($pausedFor <= 0 && $gate['calls'] < self::MAX_CALLS){
@@ -70,18 +71,9 @@ final class GrpcGate{
             }
             $gate['calls'] = $gate['calls'] + 1;
             $gate['slots'][$key] = self::IN_CALL;
-            $gate['windows'][$key] = true;
-        });
-    }
-
-    /**
-     * Every call the worker made since enter() is now waiting on the queue, so a new thread can't strand it.
-     *
-     * @param ThreadSafeArray<string, mixed> $gate
-     */
-    public static function closeWindow(ThreadSafeArray $gate, int $key) : void{
-        $gate->synchronized(static function() use ($gate, $key) : void{
-            unset($gate['windows'][$key]);
+            if($window){
+                $gate['windows'][$key] = true;
+            }
         });
     }
 
