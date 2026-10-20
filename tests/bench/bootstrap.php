@@ -7,7 +7,9 @@ declare(strict_types=1);
 // PRPC_TRANSPORT=grpc uses the real ext-grpc against examples/backend, anything else uses tests/bench/fake.
 
 use pocketmine\plugin\PluginBase;
+use pocketmine\scheduler\AsyncPool;
 use pocketmine\scheduler\TaskScheduler;
+use pRPCBench\BenchLogger;
 use pocketmine\Server;
 use pocketmine\thread\ThreadSafeClassLoader;
 use pocketmine\TimeTrackingSleeperHandler;
@@ -25,6 +27,7 @@ require $pm . '/vendor/autoload.php';
 
 $loader = new ThreadSafeClassLoader();
 $loader->addPath('Trix\\pRPC', $src, true);
+$loader->addPath('pRPCBench', __DIR__ . '/support', true);
 if($fake){
     $loader->addPath('Grpc', __DIR__ . '/fake/Grpc', true);
 }elseif(is_dir($lib = dirname(__DIR__, 2) . '/vendor/grpc/grpc/src/lib')){
@@ -56,6 +59,7 @@ final class Bench{
         $server = $serverRef->newInstanceWithoutConstructor();
         $serverRef->getProperty('tickSleeper')->setValue($server, self::$sleeper);
         $serverRef->getProperty('autoloader')->setValue($server, $loader);
+        $serverRef->getProperty('asyncPool')->setValue($server, new AsyncPool((int) (getenv('PRPC_ASYNC') ?: 2), 256, $loader, new BenchLogger(), self::$sleeper));
         $serverRef->getProperty('instance')->setValue(null, $server);
 
         $pluginRef = new ReflectionClass(PluginBase::class);

@@ -391,7 +391,14 @@ $tests['credentials never show up in stats or errors'] = static function() use (
     $client->close();
 };
 
-$tests['two full managers never run more than 6 calls at once'] = static function() use ($config, $send, $newLog, $settled, $until, $exactlyOnce, $check) : void{
+$tests['every PocketMine async worker is started up front'] = static function() use ($check) : void{
+    $async = Bench::$plugin->getServer()->getAsyncPool();
+    $manager = Open::add(new RpcClientManager(Bench::$plugin, workers: 1));
+    $check(count($async->getRunningWorkers()) === $async->getSize(), 'async workers left to start on demand');
+    $manager->close();
+};
+
+$tests['two full managers never run more than 6 calls at once'] =static function() use ($config, $send, $newLog, $settled, $until, $exactlyOnce, $check) : void{
     $gate = GrpcGate::get();
     $peak = 0;
     $log = $newLog();

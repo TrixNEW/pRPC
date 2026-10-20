@@ -7,6 +7,7 @@ namespace Trix\pRPC\internal;
 use InvalidArgumentException;
 use pmmp\thread\ThreadSafeArray;
 use pocketmine\plugin\PluginBase;
+use pocketmine\scheduler\AsyncPool;
 use pocketmine\scheduler\ClosureTask;
 use pocketmine\scheduler\TaskHandler;
 use pocketmine\snooze\SleeperHandler;
@@ -35,7 +36,9 @@ final class RpcWorkerPool{
     private const int START_WAIT_NS = 250_000_000;
     private const int RESPAWN_EVERY_NS = 1_000_000_000;
     // a hung thread never exits and holds its memory, past this many lost ones are no longer replaced
-    private const int MAX_HUNG_THREADS = 6;
+    private const int MAX_HUNG_THREADS = 16;
+    // PocketMine stops async workers idle for 5 minutes
+    private const int KEEP_ASYNC_EVERY_TICKS = 4_800;
 
     /**
      * Workers that are dead, hung, or still finishing a call after their pool closed. A thread tears down its objects
@@ -46,6 +49,7 @@ final class RpcWorkerPool{
     private static array $detached = [];
 
     private readonly SleeperHandler $sleeper;
+    private readonly AsyncPool $asyncPool;
     private ?SleeperHandlerEntry $sleeperEntry = null;
     private ?TaskHandler $task = null;
     private readonly RpcDispatchQueue $queue;
@@ -67,6 +71,7 @@ final class RpcWorkerPool{
     private int $lostWorkers = 0;
     private int $ticks = 0;
     private bool $closed = false;
+    private bool $manageAsync = true;
 
     public function __construct(
         PluginBase $plugin,
@@ -82,6 +87,7 @@ final class RpcWorkerPool{
         }
 
         $this->sleeper = $plugin->getServer()->getTickSleeper();
+        $this->asyncPool = $plugin->getServer()->getAsyncPool();
         $this->queue = new RpcDispatchQueue();
         $this->gate = GrpcGate::get();
         $this->gateOwner = GrpcGate::newKey($this->gate);
@@ -99,7 +105,10 @@ final class RpcWorkerPool{
                 throw $this->spawnError;
             }
             $this->task = $plugin->getScheduler()->scheduleRepeatingTask(new ClosureTask(function() : void{
-                $this->pump(++$this->ticks % self::WATCHDOG_EVERY_TICKS === 0);
+                if(++$this->ticks % self::KEEP_ASYNC_EVERY_TICKS === 0){
+                    $this->keepAsyncWorkers();
+                }
+                $this->pump($this->ticks % self::WATCHDOG_EVERY_TICKS === 0);
             }), 1);
         }catch(Throwable $e){
             $this->closed = true;
@@ -219,7 +228,7 @@ final class RpcWorkerPool{
                 self::reapDetached();
             }
         }
-        if($this->pendingSpawns > 0){
+        if($this->pendingSpawns > 0 || $this->asyncMissing()){
             $this->spawnPending();
         }
     }
@@ -284,7 +293,7 @@ final class RpcWorkerPool{
      * queue under any call that isn't waiting on it yet.
      */
     private function spawnPending() : bool{
-        if($this->pendingSpawns === 0){
+        if($this->pendingSpawns === 0 && !$this->asyncMissing()){
             return true;
         }
         if($this->closed || hrtime(true) < $this->nextSpawnNs || !GrpcGate::trySpawn($this->gate, $this->gateOwner)){
@@ -297,6 +306,7 @@ final class RpcWorkerPool{
                 --$this->pendingSpawns;
                 $spawned = true;
             }
+            $spawned = $this->startAsyncWorkers() || $spawned;
         }catch(Throwable $e){
             $this->spawnError = $e;
             \GlobalLogger::get()->logException($e);
@@ -305,6 +315,37 @@ final class RpcWorkerPool{
             GrpcGate::resume($this->gate, $this->gateOwner, $spawned);
         }
         return $this->pendingSpawns === 0;
+    }
+
+    private function asyncMissing() : bool{
+        return $this->manageAsync && count($this->asyncPool->getRunningWorkers()) < $this->asyncPool->getSize();
+    }
+
+    /** Started now so PocketMine doesn't start them on demand while calls are in flight. */
+    private function startAsyncWorkers() : bool{
+        $started = false;
+        try{
+            for($id = 0, $size = $this->asyncPool->getSize(); $id < $size; ++$id){
+                if(!in_array($id, $this->asyncPool->getRunningWorkers(), true)){
+                    $this->asyncPool->submitTaskToWorker(new RpcKeepAliveTask(), $id);
+                    $started = true;
+                }
+            }
+        }catch(Throwable $e){
+            $this->manageAsync = false;
+            \GlobalLogger::get()->logException($e);
+        }
+        return $started;
+    }
+
+    private function keepAsyncWorkers() : void{
+        foreach($this->asyncPool->getRunningWorkers() as $id){
+            try{
+                $this->asyncPool->submitTaskToWorker(new RpcKeepAliveTask(), $id);
+            }catch(Throwable $e){
+                \GlobalLogger::get()->logException($e);
+            }
+        }
     }
 
     private function spawn() : void{
