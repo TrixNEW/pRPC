@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 // Boots just enough of PocketMine to run pRPC outside a server.
 // PRPC_PM points at a PocketMine-MP checkout with vendor/, PRPC_SRC at the pRPC src to load (defaults to this repo).
-// PRPC_TRANSPORT=grpc uses the real ext-grpc against examples/backend, anything else uses tests/bench/fake.
+// PRPC_TRANSPORT=grpc uses the real ext-grpc against examples/backend, anything else uses tests/bench/fake or PRPC_FAKE.
 
 use pocketmine\plugin\PluginBase;
 use pocketmine\scheduler\AsyncPool;
@@ -18,6 +18,7 @@ use pocketmine\timings\TimingsHandler;
 $pm = getenv('PRPC_PM') ?: dirname(__DIR__, 3) . '/PocketMine';
 $src = getenv('PRPC_SRC') ?: dirname(__DIR__, 2) . '/src/Trix/pRPC';
 $fake = getenv('PRPC_TRANSPORT') !== 'grpc';
+$fakeDir = getenv('PRPC_FAKE') ?: __DIR__ . '/fake/Grpc';
 
 if(!is_file($pm . '/vendor/autoload.php')){
     fwrite(STDERR, "Set PRPC_PM to a PocketMine-MP checkout with composer dependencies installed.\n");
@@ -29,7 +30,7 @@ $loader = new ThreadSafeClassLoader();
 $loader->addPath('Trix\\pRPC', $src, true);
 $loader->addPath('pRPCBench', __DIR__ . '/support', true);
 if($fake){
-    $loader->addPath('Grpc', __DIR__ . '/fake/Grpc', true);
+    $loader->addPath('Grpc', $fakeDir, true);
 }elseif(is_dir($lib = dirname(__DIR__, 2) . '/vendor/grpc/grpc/src/lib')){
     // pRPC up to 0.1.0-beta.1 used grpc/grpc's BaseStub on its workers
     $loader->addPath('Grpc', $lib, true);
@@ -39,7 +40,7 @@ require dirname(__DIR__, 2) . '/vendor/autoload.php';
 $loader->register(true);
 require dirname(__DIR__) . '/grpc_constants.php';
 if($fake){
-    require __DIR__ . '/fake/Grpc/consts.php';
+    require $fakeDir . '/consts.php';
 }
 
 final class BenchPlugin extends PluginBase{}

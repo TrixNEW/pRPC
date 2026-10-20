@@ -68,7 +68,7 @@ for($rep = 1; $rep <= $reps; ++$rep){
     $config = static fn(array $e) : RpcClientConfig => new RpcClientConfig(
         endpoint: $e['target'],
         methods: [$method],
-        workers: $s['workers'] ?? 2,
+        workers: (int) (getenv('PRPC_WORKERS') ?: ($s['workers'] ?? 2)),
         batchSize: (int) (getenv('PRPC_BATCH') ?: ($s['batch'] ?? 4)),
         defaultTimeoutMs: $e['timeoutMs'],
         maxTimeoutMs: max(5_000, $e['timeoutMs']),
