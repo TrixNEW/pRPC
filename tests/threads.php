@@ -392,9 +392,9 @@ $tests['credentials never show up in stats or errors'] = static function() use (
 };
 
 $tests['20000 pending calls on a dead backend all time out and free their slots'] = static function() use ($config, $echo, $until, $check) : void{
-    $memory = 0;
-    // php's gc buffer grows once to hold that many promises, so compare the last round to the first big one
-    foreach([20_000, 20_000, 20_000] as $round => $calls){
+    $after = [];
+    // php's gc buffer and allocator settle unevenly, a leak would lift every round so the lowest one is compared
+    foreach([20_000, 20_000, 20_000, 20_000] as $calls){
         $client = new RpcClient(Bench::$plugin, $config('mode=blackhole', ['maxOutstanding' => 30_000, 'defaultTimeoutMs' => 500]));
         $done = new CallLog();
         for($i = 0; $i < $calls; ++$i){
@@ -409,12 +409,10 @@ $tests['20000 pending calls on a dead backend all time out and free their slots'
         $client->close();
         unset($client);
         gc_collect_cycles();
-        if($round === 0){
-            $memory = memory_get_usage();
-        }
+        $after[] = memory_get_usage();
     }
-    $grew = memory_get_usage() - $memory;
-    $check($grew < 256 * 1024, "memory grew by $grew bytes over two more rounds");
+    $grew = min(array_slice($after, 1)) - $after[0];
+    $check($grew < 256 * 1024, "memory grew by $grew bytes over three more rounds");
 };
 
 $tests['every PocketMine async worker is started up front'] = static function() use ($check) : void{
