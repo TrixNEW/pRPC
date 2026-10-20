@@ -153,7 +153,7 @@ final class RpcClient{
         if($metadataBytes > $this->config->maxMetadataBytes){
             return $this->rejected(new RpcMessageTooLargeException('metadata', $metadataBytes, $this->config->maxMetadataBytes));
         }
-        if($this->pool->liveWorkers() === 0){
+        if(!$this->pool->canServe()){
             return $this->rejected(new RpcWorkerException('No healthy gRPC workers are available.'));
         }
 
@@ -223,7 +223,7 @@ final class RpcClient{
      * still idle, so poll it rather than checking once.
      */
     public function isReady() : bool{
-        if($this->closed || $this->pool->liveWorkers() === 0){
+        if($this->closed || !$this->pool->canServe()){
             return false;
         }
         if($this->pool->connectivity($this->endpointId) === GrpcWorkerThread::CONNECTIVITY_READY){

@@ -27,6 +27,9 @@ $loader = new ThreadSafeClassLoader();
 $loader->addPath('Trix\\pRPC', $src, true);
 if($fake){
     $loader->addPath('Grpc', __DIR__ . '/fake/Grpc', true);
+}elseif(is_dir($lib = dirname(__DIR__, 2) . '/vendor/grpc/grpc/src/lib')){
+    // pRPC up to 0.1.0-beta.1 used grpc/grpc's BaseStub on its workers
+    $loader->addPath('Grpc', $lib, true);
 }
 require dirname(__DIR__, 2) . '/vendor/autoload.php';
 // after composer, which prepends itself and would otherwise load this repo's src over PRPC_SRC

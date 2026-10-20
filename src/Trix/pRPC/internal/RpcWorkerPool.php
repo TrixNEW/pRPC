@@ -5,15 +5,16 @@ declare(strict_types=1);
 namespace Trix\pRPC\internal;
 
 use InvalidArgumentException;
+use pmmp\thread\ThreadSafeArray;
 use pocketmine\plugin\PluginBase;
 use pocketmine\scheduler\ClosureTask;
 use pocketmine\scheduler\TaskHandler;
 use pocketmine\snooze\SleeperHandler;
 use pocketmine\snooze\SleeperHandlerEntry;
-use pocketmine\thread\ThreadManager;
 use RuntimeException;
 use Throwable;
 use Trix\pRPC\RpcClient;
+use Trix\pRPC\thread\GrpcGate;
 use Trix\pRPC\thread\GrpcWorkerThread;
 use Trix\pRPC\thread\RpcDispatchQueue;
 use Trix\pRPC\thread\RpcLane;
@@ -21,24 +22,26 @@ use Trix\pRPC\thread\RpcLane;
 /**
  * Worker threads shared by one or more clients. Each client is a lane in the dispatch queue.
  *
- * ext-grpc waits on one completion queue for the whole process and allows at most 6 threads to wait on it at once,
- * a 7th returns early while gRPC still writes into its stack. So a pool never runs more than 6 workers.
+ * ext-grpc waits on one completion queue for the whole process, see GrpcGate for how pools share it safely.
  *
  * @internal
  */
 final class RpcWorkerPool{
-    public const int MAX_WORKERS = 6;
+    public const int MAX_WORKERS = GrpcGate::MAX_CALLS;
     // gRPC enforces each call's deadline, so a worker this far past its latest one is never coming back
     private const int STUCK_GRACE_NS = 2_000_000_000;
     private const int WATCHDOG_EVERY_TICKS = 10;
     private const int STOP_WAIT_NS = 500_000_000;
+    private const int START_WAIT_NS = 250_000_000;
+    private const int RESPAWN_EVERY_NS = 1_000_000_000;
+    // a hung thread never exits and holds its memory, past this many lost ones are no longer replaced
+    private const int MAX_HUNG_THREADS = 6;
 
-    private static int $liveThreads = 0;
     /**
      * Workers that are dead, hung, or still finishing a call after their pool closed. A thread tears down its objects
-     * only when joined, so they're joined later once nothing else of theirs is running, never mid traffic.
+     * only when joined, so they're joined later once they stopped running, never mid traffic.
      *
-     * @var list<GrpcWorkerThread>
+     * @var array<int, array{GrpcWorkerThread, bool}> worker and whether it hung
      */
     private static array $detached = [];
 
@@ -46,12 +49,19 @@ final class RpcWorkerPool{
     private ?SleeperHandlerEntry $sleeperEntry = null;
     private ?TaskHandler $task = null;
     private readonly RpcDispatchQueue $queue;
+    /** @var ThreadSafeArray<string, mixed> */
+    private readonly ThreadSafeArray $gate;
+    private readonly int $gateOwner;
     /** @var array<int, GrpcWorkerThread> */
     private array $workers = [];
     /** @var array<int, RpcClient> */
     private array $clients = [];
     private int $nextEndpointId = 1;
     private int $nextWorkerId = 0;
+    private int $pendingSpawns;
+    private int $nextSpawnNs = 0;
+    private int $lastRespawnNs = PHP_INT_MIN >> 1;
+    private ?Throwable $spawnError = null;
     private int $outstanding = 0;
     private int $outstandingBytes = 0;
     private int $lostWorkers = 0;
@@ -70,32 +80,38 @@ final class RpcWorkerPool{
         if($maxOutstanding < 1 || $maxQueuedBytes < 1){
             throw new InvalidArgumentException('Pool limits must be greater than 0.');
         }
-        if(self::$liveThreads + $size > self::MAX_WORKERS){
-            \GlobalLogger::get()->warning('pRPC now runs ' . (self::$liveThreads + $size) . ' worker threads, ext-grpc only supports ' . self::MAX_WORKERS . ' waiting at once. Share one RpcClientManager instead of creating many clients.');
-        }
 
         $this->sleeper = $plugin->getServer()->getTickSleeper();
         $this->queue = new RpcDispatchQueue();
+        $this->gate = GrpcGate::get();
+        $this->gateOwner = GrpcGate::newKey($this->gate);
+        $this->pendingSpawns = $size;
         try{
             $this->sleeperEntry = $this->sleeper->addNotifier(function() : void{
                 $this->drainResults();
             });
-            for($i = 0; $i < $size; ++$i){
-                $this->spawn();
+            // calls from another pool can hold this back, past the wait the tick task finishes it
+            $waitUntil = hrtime(true) + self::START_WAIT_NS;
+            while(!$this->spawnPending() && hrtime(true) < $waitUntil && $this->spawnError === null){
+                usleep(1_000);
+            }
+            if($this->workers === [] && $this->spawnError !== null){
+                throw $this->spawnError;
             }
             $this->task = $plugin->getScheduler()->scheduleRepeatingTask(new ClosureTask(function() : void{
                 $this->pump(++$this->ticks % self::WATCHDOG_EVERY_TICKS === 0);
             }), 1);
         }catch(Throwable $e){
             $this->closed = true;
+            GrpcGate::resume($this->gate, $this->gateOwner, false);
             $this->queue->stop();
             foreach($this->workers as $worker){
                 try{
                     $worker->quit();
                 }catch(Throwable){
                 }
+                GrpcGate::forget($this->gate, $worker->gateKey);
             }
-            self::$liveThreads -= count($this->workers);
             $this->workers = [];
             if($this->sleeperEntry !== null){
                 $this->sleeper->removeNotifier($this->sleeperEntry->getNotifierId());
@@ -162,6 +178,11 @@ final class RpcWorkerPool{
         return count($this->workers);
     }
 
+    /** False once every worker is lost and none is coming, calls would only queue until they time out. */
+    public function canServe() : bool{
+        return $this->workers !== [] || $this->pendingSpawns > 0;
+    }
+
     public function lostWorkers() : int{
         return $this->lostWorkers;
     }
@@ -190,8 +211,16 @@ final class RpcWorkerPool{
         foreach($this->clients as $client){
             $client->onTick($now);
         }
-        if($watchdog && $this->outstanding > 0){
-            $this->watchdog($now);
+        if($watchdog){
+            if($this->outstanding > 0){
+                $this->watchdog($now);
+            }
+            if(self::$detached !== []){
+                self::reapDetached();
+            }
+        }
+        if($this->pendingSpawns > 0){
+            $this->spawnPending();
         }
     }
 
@@ -222,40 +251,76 @@ final class RpcWorkerPool{
             $this->drainResults();
             $this->queue->abandon($worker);
             unset($this->workers[$workerId]);
-            --self::$liveThreads;
             ++$this->lostWorkers;
 
             if($failed){
+                GrpcGate::forget($this->gate, $worker->gateKey);
                 $lastError = $worker->getLastError();
                 $reason = "gRPC worker $workerId terminated unexpectedly." . ($lastError !== '' ? ' Last error: ' . $lastError : '');
             }else{
+                $worker->markHung();
+                GrpcGate::lose($this->gate, $worker->gateKey);
                 $reason = "gRPC worker $workerId stopped responding inside a call and was replaced.";
             }
-            self::$detached[] = $worker;
+            self::$detached[] = [$worker, $stuck];
             \GlobalLogger::get()->warning('pRPC: ' . $reason);
             if($snapshot['endpoint'] >= 0){
                 ($this->clients[$snapshot['endpoint']] ?? null)?->onTransportLost($snapshot['ids'], $reason);
             }
 
-            if($this->lostWorkers <= $this->size * 2){
-                try{
-                    $this->spawn();
-                }catch(Throwable $e){
-                    \GlobalLogger::get()->logException($e);
-                }
+            if(self::hungThreads() < self::MAX_HUNG_THREADS){
+                // the first replacement is immediate, a crash loop gets one per second
+                ++$this->pendingSpawns;
+                $this->nextSpawnNs = max($now, $this->lastRespawnNs + self::RESPAWN_EVERY_NS);
+                $this->lastRespawnNs = $this->nextSpawnNs;
+            }else{
+                \GlobalLogger::get()->error('pRPC: ' . self::MAX_HUNG_THREADS . ' worker threads are stuck inside ext-grpc, lost workers are no longer replaced.');
             }
         }
     }
 
+    /**
+     * Starts the workers still owed once no call anywhere in the process is in flight, since a new thread replaces
+     * ext-grpc's completion queue under any running call.
+     */
+    private function spawnPending() : bool{
+        if($this->pendingSpawns === 0){
+            return true;
+        }
+        if($this->closed || hrtime(true) < $this->nextSpawnNs || !GrpcGate::trySpawn($this->gate, $this->gateOwner)){
+            return false;
+        }
+        $spawned = false;
+        try{
+            while($this->pendingSpawns > 0){
+                $this->spawn();
+                --$this->pendingSpawns;
+                $spawned = true;
+            }
+        }catch(Throwable $e){
+            $this->spawnError = $e;
+            \GlobalLogger::get()->logException($e);
+            $this->nextSpawnNs = hrtime(true) + self::RESPAWN_EVERY_NS;
+        }finally{
+            GrpcGate::resume($this->gate, $this->gateOwner, $spawned);
+        }
+        return $this->pendingSpawns === 0;
+    }
+
     private function spawn() : void{
-        $worker = new GrpcWorkerThread($this->queue, $this->sleeperEntry ?? throw new RuntimeException('No sleeper entry.'), $this->nextWorkerId++);
+        $worker = new GrpcWorkerThread(
+            $this->queue,
+            $this->sleeperEntry ?? throw new RuntimeException('No sleeper entry.'),
+            $this->gate,
+            GrpcGate::newKey($this->gate),
+            $this->nextWorkerId++
+        );
         $this->queue->addWorker();
         if(!$worker->start()){
             $this->queue->abandon($worker);
             throw new RuntimeException("Failed to start gRPC worker {$worker->workerId}.");
         }
         $this->workers[$worker->workerId] = $worker;
-        ++self::$liveThreads;
     }
 
     /**
@@ -268,6 +333,8 @@ final class RpcWorkerPool{
         }
         $this->task?->cancel();
         $this->task = null;
+        GrpcGate::resume($this->gate, $this->gateOwner, false);
+        $this->pendingSpawns = 0;
         foreach($this->clients as $client){
             $client->markClosed();
         }
@@ -298,7 +365,7 @@ final class RpcWorkerPool{
         $idle = [];
         foreach($this->workers as $worker){
             if($worker->snapshot()['endpoint'] >= 0){
-                self::$detached[] = $worker;
+                self::$detached[] = [$worker, false];
             }else{
                 $idle[] = $worker;
             }
@@ -311,15 +378,11 @@ final class RpcWorkerPool{
         }
         foreach($idle as $worker){
             if($worker->isRunning()){
-                self::$detached[] = $worker;
+                self::$detached[] = [$worker, false];
                 continue;
             }
-            try{
-                $worker->quit();
-            }catch(Throwable){
-            }
+            self::join($worker);
         }
-        self::$liveThreads -= count($this->workers);
         $this->workers = [];
         self::reapDetached();
 
@@ -333,16 +396,28 @@ final class RpcWorkerPool{
         return $this->closed;
     }
 
+    private static function hungThreads() : int{
+        $n = 0;
+        foreach(self::$detached as [, $hung]){
+            $n += $hung ? 1 : 0;
+        }
+        return $n;
+    }
+
+    private static function join(GrpcWorkerThread $worker) : void{
+        try{
+            $worker->quit();
+        }catch(Throwable){
+        }
+        GrpcGate::forget(GrpcGate::get(), $worker->gateKey);
+    }
+
     private static function reapDetached() : void{
-        foreach(self::$detached as $i => $worker){
+        foreach(self::$detached as $i => [$worker]){
             if(!$worker->isRunning()){
-                try{
-                    $worker->quit();
-                }catch(Throwable){
-                }
+                self::join($worker);
                 unset(self::$detached[$i]);
             }
         }
-        self::$detached = array_values(self::$detached);
     }
 }

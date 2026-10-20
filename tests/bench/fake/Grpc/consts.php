@@ -12,6 +12,8 @@ foreach([
     'STATUS_UNAVAILABLE' => 14, 'STATUS_DATA_LOSS' => 15, 'STATUS_UNAUTHENTICATED' => 16,
     'CHANNEL_IDLE' => 0, 'CHANNEL_CONNECTING' => 1, 'CHANNEL_READY' => 2, 'CHANNEL_TRANSIENT_FAILURE' => 3,
     'CHANNEL_FATAL_FAILURE' => 4,
+    'OP_SEND_INITIAL_METADATA' => 0, 'OP_SEND_MESSAGE' => 1, 'OP_SEND_CLOSE_FROM_CLIENT' => 2,
+    'OP_RECV_INITIAL_METADATA' => 4, 'OP_RECV_MESSAGE' => 5, 'OP_RECV_STATUS_ON_CLIENT' => 6,
 ] as $name => $value){
     if(!\defined("Grpc\\$name")){
         \define("Grpc\\$name", $value);

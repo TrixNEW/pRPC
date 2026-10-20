@@ -6,7 +6,6 @@
   "require": {
     "php": ">=8.4",
     "ext-grpc": "*",
-    "grpc/grpc": "^1.82",
     "google/protobuf": "^4.31 || ^5.0"
   },
   "suggest": {

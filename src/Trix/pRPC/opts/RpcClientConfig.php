@@ -21,6 +21,8 @@ final readonly class RpcClientConfig{
      * @param array<string, mixed> $channelOptions Scalar/null/nested-array values only.
      * @param int $workers Worker threads for a standalone client, at most 6. With RpcClientManager it caps how many
      *                     of the shared workers this endpoint may hold at once.
+     * @param int $batchSize Calls one worker runs at once. Above 1 they're pipelined, which helps a slow backend but
+     *                       can hang a worker for good when any other thread starts mid batch, see the README.
      * @param int $maxQueuedBytes Bounds the request bytes queued or in flight, alongside maxOutstanding.
      */
     public function __construct(
@@ -28,8 +30,8 @@ final readonly class RpcClientConfig{
         array $methods,
         ?RpcCredentials $credentials = null,
         array $channelOptions = [],
-        public int $workers = 2,
-        public int $batchSize = 4,
+        public int $workers = 4,
+        public int $batchSize = 1,
         public int $defaultTimeoutMs = 1_500,
         public int $maxTimeoutMs = 5_000,
         public int $maxOutstanding = 4_096,

@@ -101,10 +101,6 @@ final class RpcDispatchQueue extends ThreadSafe{
         });
     }
 
-    public function epoch() : int{
-        return $this->synchronized(fn() : int => $this->epoch);
-    }
-
     public function laneConfig(int $endpointId) : ?string{
         return $this->synchronized(fn() : ?string => ($this->lanes[$endpointId] ?? null)?->config);
     }
@@ -112,7 +108,8 @@ final class RpcDispatchQueue extends ThreadSafe{
     /**
      * Blocks until a batch is available, round robin across endpoints whose lane is under its worker cap.
      *
-     * @return array{int, list<string>}|null null once the pool is stopping and nothing is left to run
+     * @return array{int, list<string>, int}|null endpoint, jobs and the lane epoch, null once the pool is stopping and
+     *                                            nothing is left to run
      */
     public function take(GrpcWorkerThread $worker) : ?array{
         return $this->synchronized(function() use ($worker) : ?array{
@@ -141,20 +138,17 @@ final class RpcDispatchQueue extends ThreadSafe{
                     ++$this->busy;
                     $this->cursor = $pick;
                     $ids = '';
-                    $untilNs = 0;
                     foreach($jobs as $job){
-                        if($job !== GrpcWorkerThread::PROBE_JOB){
-                            $h = unpack('Jid/Jdeadline', $job);
-                            $ids .= pack('J', $h['id']);
-                            $untilNs = max($untilNs, $h['deadline']);
+                        if(strlen($job) >= GrpcWorkerThread::JOB_HEADER_BYTES){
+                            $ids .= substr($job, 0, 8);
                         }
                     }
-                    $worker->markBusy($pick, $untilNs, $ids);
+                    $worker->markBusy($pick, $ids);
                     // hand the rest to another idle worker instead of waking all of them on every push
                     if(count($eligible) > 1 || ($lane->busy < $lane->cap && $lane->jobs->count() > 0)){
                         $this->notifyOne();
                     }
-                    return [$pick, $jobs];
+                    return [$pick, $jobs, $this->epoch];
                 }
                 if($this->stopping){
                     return null;

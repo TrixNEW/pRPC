@@ -15,6 +15,7 @@ use Trix\pRPC\opts\RpcCredentials;
 use Trix\pRPC\RpcClient;
 use Trix\pRPC\RpcClientManager;
 use Trix\pRPC\RpcMethod;
+use Trix\pRPC\thread\GrpcGate;
 use Trix\pRPC\utils\exception\RpcClosedException;
 use Trix\pRPC\utils\exception\RpcException;
 use Trix\pRPC\utils\exception\RpcOverloadedException;
@@ -111,7 +112,7 @@ $pRPCThreads = static fn() : int => count(array_filter(ThreadManager::getInstanc
 $tests = [];
 
 $tests['single endpoint, light and heavy traffic, every response matches its request'] = static function() use ($config, $send, $newLog, $settled, $until, $exactlyOnce, $check, $p99) : void{
-    $client = Open::add(new RpcClient(Bench::$plugin, $config('lat=300,jit=300', ['maxOutstanding' => 10_000])));
+    $client = Open::add(new RpcClient(Bench::$plugin, $config('lat=300,jit=300', ['maxOutstanding' => 10_000, 'batchSize' => 4])));
     $warm = $newLog();
     $send($client, 'warm-up', $warm);
     $until(static fn() : bool => $settled($warm));
@@ -136,7 +137,7 @@ $tests['2, 4, 8 and 16 endpoints on one manager stay correctly routed'] = static
         $manager = Open::add(new RpcClientManager(Bench::$plugin, workers: 4));
         $log = $newLog();
         for($e = 0; $e < $n; ++$e){
-            $manager->register("e$e", $config('lat=500,jit=2000'));
+            $manager->register("e$e", $config('lat=500,jit=2000', ['defaultTimeoutMs' => 4_000]));
         }
         $check($manager->threadCount() === 4 && $pRPCThreads() === 4, "$n endpoints should still use 4 threads");
         for($i = 0; $i < 200; ++$i){
@@ -390,7 +391,126 @@ $tests['credentials never show up in stats or errors'] = static function() use (
     $client->close();
 };
 
-$tests['repeated client creation and destruction leaves nothing behind'] = static function() use ($config, $send, $newLog, $settled, $until, $check, $pRPCThreads) : void{
+$tests['two full managers never run more than 6 calls at once'] = static function() use ($config, $send, $newLog, $settled, $until, $exactlyOnce, $check) : void{
+    $gate = GrpcGate::get();
+    $peak = 0;
+    $log = $newLog();
+    $managers = [];
+    foreach(['a', 'b'] as $name){
+        $manager = $managers[] = Open::add(new RpcClientManager(Bench::$plugin, workers: 6));
+        $client = $manager->register($name, $config('lat=2000', ['workers' => 6, 'maxOutstanding' => 10_000, 'defaultTimeoutMs' => 5_000]));
+        for($i = 0; $i < 1_000; ++$i){
+            $send($client, "$name-$i", $log);
+        }
+    }
+    $until(static function() use (&$peak, $gate, $settled, $log) : bool{
+        $peak = max($peak, GrpcGate::calls($gate));
+        return $settled($log);
+    }, 20);
+    $exactlyOnce($log);
+    $check($log->ok === 2_000, json_encode($log->err));
+    $check($peak <= GrpcGate::MAX_CALLS && $peak >= 4, "peak of $peak calls in flight");
+    foreach($managers as $manager){
+        $manager->close();
+    }
+};
+
+$tests['a lost worker is replaced at once while another pool has a long call in flight'] = static function() use ($config, $send, $newLog, $settled, $until, $check) : void{
+    $busy = Open::add(new RpcClientManager(Bench::$plugin, workers: 1));
+    $dead = $busy->register('dead', $config('mode=blackhole', ['workers' => 1, 'defaultTimeoutMs' => 4_000]));
+    $deadLog = $newLog();
+    $send($dead, 'dead', $deadLog);
+    $until(static fn() : bool => GrpcGate::calls(GrpcGate::get()) === 1, 2);
+
+    $manager = Open::add(new RpcClientManager(Bench::$plugin, workers: 2));
+    $check($manager->threadCount() === 2, 'a new pool waited for a call in flight elsewhere');
+    $crash = $manager->register('crash', $config('mode=crash', ['workers' => 1, 'defaultTimeoutMs' => 3_000]));
+    $ok = $manager->register('ok', $config('lat=200'));
+    $log = $newLog();
+    $send($crash, 'c', $log);
+    $until(static fn() : bool => $settled($log), 5);
+    $start = hrtime(true);
+    $until(static fn() : bool => $manager->threadCount() === 2, 2);
+    $check((hrtime(true) - $start) / 1e6 < 500, 'replacement waited for the long call');
+    $okLog = $newLog();
+    $send($ok, 'ok', $okLog);
+    $until(static fn() : bool => $settled($okLog));
+    $check($okLog->ok === 1 && !$settled($deadLog), json_encode($okLog->err));
+    $manager->close();
+    $busy->close(0);
+};
+
+$tests['endpoints registered and removed under traffic leave no accounting behind'] = static function() use ($config, $send, $newLog, $settled, $until, $exactlyOnce, $check) : void{
+    // a leaked slot in the shared limits would turn into overload errors on the endpoint that stays
+    $manager = Open::add(new RpcClientManager(Bench::$plugin, workers: 3, maxOutstanding: 64));
+    $keep = $manager->register('keep', $config('lat=300'));
+    $keepLog = $newLog();
+    $tmpLog = $newLog();
+    for($round = 0; $round < 150; ++$round){
+        $tmp = $manager->register("tmp$round", $config('lat=500,jit=500'));
+        for($i = 0; $i < 5; ++$i){
+            $send($tmp, "tmp$round-$i", $tmpLog);
+        }
+        $send($keep, "keep-$round", $keepLog);
+        if($round % 3 === 0){
+            $until(static fn() : bool => $settled($keepLog));
+        }
+        $manager->remove("tmp$round", $round % 2 === 0 ? 0 : 20);
+    }
+    $until(static fn() : bool => $settled($keepLog) && $settled($tmpLog));
+    $exactlyOnce($keepLog);
+    $exactlyOnce($tmpLog);
+    $check($keepLog->ok === 150, 'kept endpoint failed: ' . json_encode($keepLog->err));
+    $check(array_keys($tmpLog->err) === [] || array_keys($tmpLog->err) === ['RpcClosedException:1'], json_encode($tmpLog->err));
+    $check($manager->names() === ['keep'] && $keep->outstandingCount() === 0, 'endpoints or calls left behind');
+    $manager->close();
+};
+
+$tests['oversized and undecodable responses fail cleanly'] = static function() use ($config, $send, $newLog, $settled, $until, $check) : void{
+    $big = Open::add(new RpcClient(Bench::$plugin, $config('lat=100', ['maxResponseBytes' => 100])));
+    $bad = Open::add(new RpcClient(Bench::$plugin, $config('lat=100,mode=garbage')));
+    $log = $newLog();
+    $send($big, str_repeat('x', 200), $log);
+    $send($big, 'small', $log);
+    $send($bad, 'garbage', $log);
+    $until(static fn() : bool => $settled($log));
+    $check($log->ok === 1 && ($log->err['RpcException:13'] ?? 0) === 2, json_encode($log->err));
+    $big->close();
+    $bad->close();
+};
+
+$tests['a long run keeps memory flat'] = static function() use ($config, $echo, $until, $check) : void{
+    $rounds = (int) (getenv('PRPC_LONG_ROUNDS') ?: 20);
+    $manager = Open::add(new RpcClientManager(Bench::$plugin, workers: 4));
+    $client = $manager->register('a', $config('lat=50', ['workers' => 4, 'maxOutstanding' => 10_000]));
+    $done = new CallLog();
+    $memory = 0;
+    for($round = 0; $round < $rounds; ++$round){
+        $target = ($round + 1) * 5_000;
+        for($i = 0; $i < 5_000; ++$i){
+            $client->call($echo, new StringValue(['value' => 'long']))
+                ->then(static function() use ($done) : void{
+                    ++$done->ok;
+                })
+                ->onError(static function() use ($done) : void{
+                    ++$done->wrong;
+                });
+        }
+        $until(static fn() : bool => $done->ok + $done->wrong >= $target, 30);
+        if($round === 2){
+            gc_collect_cycles();
+            $memory = memory_get_usage();
+        }
+    }
+    gc_collect_cycles();
+    $grew = memory_get_usage() - $memory;
+    $check($done->wrong === 0 && $done->ok === $rounds * 5_000, "{$done->wrong} calls failed");
+    $check($client->outstandingCount() === 0 && $client->pendingCount() === 0, 'calls left behind');
+    $check($grew < 256 * 1024, "memory grew by $grew bytes over " . ($rounds * 5_000) . ' calls');
+    $manager->close();
+};
+
+$tests['repeated client creation and destruction leaves nothing behind'] =static function() use ($config, $send, $newLog, $settled, $until, $check, $pRPCThreads) : void{
     $memory = 0;
     // a stuck worker from an earlier test may still be finishing in the background
     $threadsBefore = $pRPCThreads();
@@ -400,10 +520,6 @@ $tests['repeated client creation and destruction leaves nothing behind'] = stati
         $send($client, "r-$round", $log);
         $until(static fn() : bool => $settled($log));
         $client->close();
-        if(getenv('PRPC_DEBUG')){
-            echo "round $round
-";
-        }
         if($round === 4){
             gc_collect_cycles();
             $memory = memory_get_usage();
@@ -412,6 +528,10 @@ $tests['repeated client creation and destruction leaves nothing behind'] = stati
     gc_collect_cycles();
     $check($pRPCThreads() <= $threadsBefore, 'threads leaked');
     $check(memory_get_usage() - $memory < 512 * 1024, 'memory grew by ' . (memory_get_usage() - $memory) . ' bytes');
+};
+
+$tests['every call slot comes back once background calls end'] = static function() use ($until) : void{
+    $until(static fn() : bool => GrpcGate::calls(GrpcGate::get()) === 0, 10);
 };
 
 $failures = 0;

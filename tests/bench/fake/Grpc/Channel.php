@@ -7,20 +7,21 @@ namespace Grpc;
 require_once __DIR__ . '/consts.php';
 
 /**
- * Stand-in for ext-grpc that keeps its blocking model: calls run concurrently once started, and wait() blocks
- * until that one call finishes. The target encodes the backend, e.g. "fake:lat=1000,jit=200,mode=ok".
+ * Stand-in for ext-grpc's Channel. The target encodes the backend, e.g. "fake:lat=1000,jit=200,mode=ok".
  * Modes: ok, down (fast UNAVAILABLE), blackhole (hangs until the deadline), flap=<ms> (alternates ok and down),
- * hang with hang=<ms> (blocks past the deadline), crash (kills the worker thread), fail (channel setup throws).
+ * hang with hang=<ms> (blocks past the deadline), crash (kills the worker thread), fail (channel setup throws),
+ * garbage (answers OK with bytes that don't decode).
+ * cpu=<us> burns that much worker CPU per call.
  */
-class BaseStub{
+class Channel{
     /** @var array{lat: int, jit: int, mode: string, flap: int, cpu: int} */
     public array $model;
     private int $createdNs;
 
     /** @param array<string, mixed> $opts */
-    public function __construct(string $hostname, array $opts){
+    public function __construct(string $target, array $opts){
         $model = ['lat' => 1000, 'jit' => 0, 'mode' => 'ok', 'flap' => 0, 'cpu' => 0];
-        $spec = str_starts_with($hostname, 'fake:') ? substr($hostname, 5) : '';
+        $spec = str_starts_with($target, 'fake:') ? substr($target, 5) : '';
         foreach(explode(',', $spec) as $pair){
             if($pair === ''){
                 continue;
@@ -45,13 +46,6 @@ class BaseStub{
 
     public function getConnectivityState(bool $tryToConnect = false) : int{
         return $this->down() ? CHANNEL_TRANSIENT_FAILURE : CHANNEL_READY;
-    }
-
-    /** @param array<string, list<string>> $metadata @param array<string, mixed> $options */
-    protected function _simpleRequest(string $method, object $argument, callable $deserialize, array $metadata = [], array $options = []) : UnaryCall{
-        $call = new UnaryCall($this, $deserialize, (int) ($options['timeout'] ?? 1_000_000));
-        $call->start($argument->serializeToString());
-        return $call;
     }
 
     public function close() : void{}
