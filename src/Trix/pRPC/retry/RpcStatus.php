@@ -38,7 +38,7 @@ final class RpcStatus{
     }
 
     public static function notSent(Throwable $e) : bool{
-        return $e instanceof RpcOverloadedException || $e instanceof RpcMessageTooLargeException;
+        return $e instanceof RpcOverloadedException || $e instanceof RpcMessageTooLargeException || ($e instanceof RpcWorkerException && !$e->sent);
     }
 
     public static function isAmbiguous(Throwable $e) : bool{

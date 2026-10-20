@@ -17,6 +17,7 @@ use Trix\pRPC\utils\exception\RpcException;
 use Trix\pRPC\utils\exception\RpcMessageTooLargeException;
 use Trix\pRPC\utils\exception\RpcOverloadedException;
 use Trix\pRPC\utils\exception\RpcTimeoutException;
+use Trix\pRPC\utils\exception\RpcWorkerException;
 use Trix\pRPC\utils\promise\RpcPromise;
 use Trix\pRPC\utils\promise\RpcPromiseResolver;
 
@@ -115,6 +116,8 @@ $test('failures are classified by whether a retry is safe', static function() : 
         [new RpcMessageTooLargeException('request', 10, 5), false, false],
         [new RpcTimeoutException(100), true, true],
         [new RpcClosedException(), false, true],
+        [new RpcWorkerException('lost mid call'), true, true],
+        [new RpcWorkerException('never queued', sent: false), true, false],
         [new RpcException('down', RpcStatus::UNAVAILABLE), true, true],
         [new RpcException('busy', RpcStatus::RESOURCE_EXHAUSTED), true, false],
         [new RpcException('rule', RpcStatus::FAILED_PRECONDITION), false, false],

@@ -69,7 +69,7 @@ for($rep = 1; $rep <= $reps; ++$rep){
         endpoint: $e['target'],
         methods: [$method],
         workers: $s['workers'] ?? 2,
-        batchSize: $s['batch'] ?? 4,
+        batchSize: (int) (getenv('PRPC_BATCH') ?: ($s['batch'] ?? 4)),
         defaultTimeoutMs: $e['timeoutMs'],
         maxTimeoutMs: max(5_000, $e['timeoutMs']),
         maxOutstanding: 65_536

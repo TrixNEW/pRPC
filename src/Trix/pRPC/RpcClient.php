@@ -154,7 +154,7 @@ final class RpcClient{
             return $this->rejected(new RpcMessageTooLargeException('metadata', $metadataBytes, $this->config->maxMetadataBytes));
         }
         if(!$this->pool->canServe()){
-            return $this->rejected(new RpcWorkerException('No healthy gRPC workers are available.'));
+            return $this->rejected(new RpcWorkerException('No healthy gRPC workers are available.', sent: false));
         }
 
         try{
@@ -183,7 +183,7 @@ final class RpcClient{
         $deadlineNs = $now + $timeoutMs * 1_000_000;
         $job = pack('JJJNN', $id, $deadlineNs, $now, $this->methodIdsByPath[$method->path], strlen($options->packedMetadata)) . $options->packedMetadata . $requestData;
         if(!$this->pool->submit($this->endpointId, $job, $jobBytes)){
-            return $this->rejected(new RpcWorkerException('Failed to queue RPC: the worker pool is stopping.'));
+            return $this->rejected(new RpcWorkerException('Failed to queue RPC: the worker pool is stopping.', sent: false));
         }
 
         /** @var RpcPromiseResolver<Message> $resolver */
