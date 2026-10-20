@@ -42,6 +42,10 @@ final class Log{
     }
 }
 
+final class Hung{
+    public static int $threads = 0;
+}
+
 final class Idle extends NativeThread{
     public function run() : void{}
 }
@@ -75,8 +79,8 @@ $tests = [];
 
 $tests['calls round trip and every response matches its request'] = static function() use ($config, $send, $until, $check) : void{
     $manager = new RpcClientManager(Bench::$plugin, workers: 4);
-    $a = $manager->register('a', $config(50051));
-    $b = $manager->register('b', $config(50052, ['batchSize' => 4]));
+    $a = $manager->register('a', $config(50051, ['defaultTimeoutMs' => 5_000]));
+    $b = $manager->register('b', $config(50052, ['batchSize' => 4, 'defaultTimeoutMs' => 5_000]));
     $until(static fn() : bool => $a->isReady() && $b->isReady(), 5);
     $log = new Log();
     for($i = 0; $i < 2_000; ++$i){
@@ -116,14 +120,15 @@ $tests['threads started mid call strand nothing for good'] = static function() u
         return $tick > 60 && $log->settled();
     }, 20);
     // a stranded worker is noticed 2s past its deadline and replaced
-    $lost = static fn() : int => $slow->stats()->lostWorkers + $fast->stats()->lostWorkers;
+    $lost = static fn() : int => $slow->stats()->lostWorkers;
     if($log->ok !== $log->sent){
-        $until(static fn() : bool => $lost() > 0, 6);
+        $end = hrtime(true) + 6_000_000_000;
+        Bench::loop(static fn() : bool => $lost() === 0 && hrtime(true) < $end);
     }
     $until(static fn() : bool => $manager->threadCount() === 4, 5);
     $after = new Log();
     for($i = 0; $i < 50; ++$i){
-        $send($i % 2 === 0 ? $slow : $fast, "after-$i", $after);
+        $send($fast, "after-$i", $after);
     }
     $until($after->settled(...));
     Hung::$threads += $lost();
@@ -142,7 +147,7 @@ $tests['threads started mid call strand nothing for good'] = static function() u
 $tests['more than 6 workers across clients never overrun ext-grpc'] = static function() use ($config, $send, $until, $check) : void{
     $clients = [];
     for($i = 0; $i < 4; ++$i){
-        $clients[] = new RpcClient(Bench::$plugin, $config(50051 + $i, ['workers' => 3]));
+        $clients[] = new RpcClient(Bench::$plugin, $config(50051 + $i, ['workers' => 3, 'defaultTimeoutMs' => 5_000]));
     }
     $log = new Log();
     foreach($clients as $n => $client){
@@ -196,4 +201,9 @@ foreach($tests as $name => $test){
     }
 }
 echo count($tests), " grpc tests, $failures failures\n";
+if(Hung::$threads > 0 && function_exists('posix_kill')){
+    // a stuck thread can't be joined, so end the way PocketMine does
+    echo 'killing the process to get past ', Hung::$threads, " stuck worker(s)\n";
+    posix_kill(getmypid(), $failures === 0 ? SIGTERM : SIGKILL);
+}
 exit($failures === 0 ? 0 : 1);

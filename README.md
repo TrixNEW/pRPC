@@ -240,7 +240,7 @@ With every thread started before the first call, stock ext-grpc hung 0 of 15 tim
 
 `php tests/threads.php` runs real worker threads against [the fake transport](tests/bench/fake) and needs pmmpthread plus a PocketMine-MP checkout in `PRPC_PM`. It covers 2 to 16 endpoints, slow, dead, flapping and hung endpoints, fairness, limits, timeouts, crashed and stuck workers, the 6 call cap across pools, replacement while other calls are in flight, endpoints added and removed under traffic, oversized and undecodable responses, 20,000 pending calls, 100,000 calls with flat memory (`PRPC_LONG_ROUNDS` scales it), shutdown and repeated creation.
 
-`php tests/grpc.php` runs real worker threads against ext-grpc and [examples/backend](examples/backend). It covers round trips in both call modes, threads started mid call, more than 6 workers across clients, and down, blackhole and flapping backends.
+`php tests/grpc.php` runs real worker threads against ext-grpc and [examples/backend](examples/backend). It covers round trips in both call modes, threads started mid call, more than 6 workers across clients, and down, blackhole and flapping backends. On a stock ext-grpc the thread test checks that a stranded worker is replaced, and the script then ends itself with SIGTERM since that thread can't be joined. Set `PRPC_PATCHED=1` on a build with the native fix to require that nothing is stranded at all.
 
 ## Production checklist
 
