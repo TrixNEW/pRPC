@@ -391,6 +391,32 @@ $tests['credentials never show up in stats or errors'] = static function() use (
     $client->close();
 };
 
+$tests['20000 pending calls on a dead backend all time out and free their slots'] = static function() use ($config, $echo, $until, $check) : void{
+    $memory = 0;
+    // php's gc buffer grows once to hold that many promises, so compare the last round to the first big one
+    foreach([20_000, 20_000, 20_000] as $round => $calls){
+        $client = new RpcClient(Bench::$plugin, $config('mode=blackhole', ['maxOutstanding' => 30_000, 'defaultTimeoutMs' => 500]));
+        $done = new CallLog();
+        for($i = 0; $i < $calls; ++$i){
+            $client->call($echo, new StringValue(['value' => 'x']))->onError(static function(Throwable $e) use ($done) : void{
+                $e instanceof RpcTimeoutException || ($e instanceof RpcException && $e->getStatusCode() === 4) ? ++$done->ok : ++$done->wrong;
+            });
+        }
+        $check($client->pendingCount() === $calls, 'pending ' . $client->pendingCount());
+        $until(static fn() : bool => $done->ok + $done->wrong === $calls, 5);
+        $until(static fn() : bool => $client->outstandingCount() === 0, 5);
+        $check($done->wrong === 0, "{$done->wrong} failed with something other than a timeout");
+        $client->close();
+        unset($client);
+        gc_collect_cycles();
+        if($round === 0){
+            $memory = memory_get_usage();
+        }
+    }
+    $grew = memory_get_usage() - $memory;
+    $check($grew < 256 * 1024, "memory grew by $grew bytes over two more rounds");
+};
+
 $tests['every PocketMine async worker is started up front'] = static function() use ($check) : void{
     $async = Bench::$plugin->getServer()->getAsyncPool();
     $manager = Open::add(new RpcClientManager(Bench::$plugin, workers: 1));

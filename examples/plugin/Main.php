@@ -43,7 +43,6 @@ final class Main extends PluginBase{
                 methods: [$this->getPlayer, $this->savePlayer],
                 credentials: RpcCredentials::insecure(),
                 workers: 4,
-                batchSize: 4,
                 defaultTimeoutMs: 1500,
                 maxTimeoutMs: 5000,
                 maxOutstanding: 4096
