@@ -37,8 +37,8 @@ final class RpcWorkerPool{
     private const int RESPAWN_EVERY_NS = 1_000_000_000;
     // a hung thread never exits and holds its memory, past this many lost ones are no longer replaced
     private const int MAX_HUNG_THREADS = 16;
-    // PocketMine stops async workers idle for 5 minutes
-    private const int KEEP_ASYNC_EVERY_TICKS = 4_800;
+    // PocketMine stops async workers idle for 5 minutes, wall time so a lagging server still makes it
+    private const int KEEP_ASYNC_EVERY_NS = 120_000_000_000;
 
     /**
      * Workers that are dead, hung, or still finishing a call after their pool closed. A thread tears down its objects
@@ -72,6 +72,7 @@ final class RpcWorkerPool{
     private int $ticks = 0;
     private bool $closed = false;
     private bool $manageAsync = true;
+    private int $nextKeepAsyncNs = 0;
 
     public function __construct(
         PluginBase $plugin,
@@ -105,10 +106,7 @@ final class RpcWorkerPool{
                 throw $this->spawnError;
             }
             $this->task = $plugin->getScheduler()->scheduleRepeatingTask(new ClosureTask(function() : void{
-                if(++$this->ticks % self::KEEP_ASYNC_EVERY_TICKS === 0){
-                    $this->keepAsyncWorkers();
-                }
-                $this->pump($this->ticks % self::WATCHDOG_EVERY_TICKS === 0);
+                $this->pump(++$this->ticks % self::WATCHDOG_EVERY_TICKS === 0);
             }), 1);
         }catch(Throwable $e){
             $this->closed = true;
@@ -227,6 +225,10 @@ final class RpcWorkerPool{
             if(self::$detached !== []){
                 self::reapDetached();
             }
+            if($now >= $this->nextKeepAsyncNs){
+                $this->nextKeepAsyncNs = $now + self::KEEP_ASYNC_EVERY_NS;
+                $this->keepAsyncWorkers();
+            }
         }
         if($this->pendingSpawns > 0 || $this->asyncMissing()){
             $this->spawnPending();
@@ -339,10 +341,11 @@ final class RpcWorkerPool{
     }
 
     private function keepAsyncWorkers() : void{
-        foreach($this->asyncPool->getRunningWorkers() as $id){
+        foreach($this->manageAsync ? $this->asyncPool->getRunningWorkers() : [] as $id){
             try{
                 $this->asyncPool->submitTaskToWorker(new RpcKeepAliveTask(), $id);
             }catch(Throwable $e){
+                $this->manageAsync = false;
                 \GlobalLogger::get()->logException($e);
             }
         }
