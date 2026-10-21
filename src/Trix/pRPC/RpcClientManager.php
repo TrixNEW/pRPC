@@ -25,7 +25,7 @@ final class RpcClientManager{
     private array $clients = [];
 
     /**
-     * @param int $workers threads shared by every endpoint, at most 6
+     * @param int $workers threads shared by every endpoint, at most 6, or 16 on an ext-grpc with a queue per thread
      * @param int $maxOutstanding requests in flight across every endpoint
      * @param int $maxQueuedBytes request bytes queued or in flight across every endpoint
      */

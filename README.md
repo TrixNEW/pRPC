@@ -181,7 +181,16 @@ Threads started by other plugins can't be held back. The complete fix is one que
 
 ### Native fix
 
-In ext-grpc's `src/php/ext/grpc/completion_queue.c` declare `TSRM_TLS grpc_completion_queue *completion_queue;` and in `completion_queue.h` make the extern `extern TSRM_TLS grpc_completion_queue *completion_queue;` (`ZEND_TLS` doesn't work here, it includes `static`). Every thread then creates and waits on its own queue in its own `RINIT`, so neither limit applies.
+[TrixNEW/ext-grpc](https://github.com/TrixNEW/ext-grpc) is ext-grpc 1.74.0 with `completion_queue` declared `TSRM_TLS` in `completion_queue.c` and `.h` (`ZEND_TLS` doesn't work there, it includes `static`). Every thread then creates and waits on its own queue in its own `RINIT`, so neither limit applies. It also defines `Grpc\PER_THREAD_COMPLETION_QUEUE`, and when pRPC sees that it drops the 6 call cap, the spawn pauses and the async worker keep alive, allows up to 16 workers per pool, and `batchSize` above 1 is safe.
+
+On the real gRPC setup below, with the fix:
+
+| Workers × batch | 5,000 RPS p50 / p99 | 20,000 call burst |
+| --- | ---: | ---: |
+| 6 × 1, the stock limit | 569 / 1004 ms, falling behind | 4.3k RPS |
+| 12 × 1 | 13.5 / 104 ms | 7.1k RPS |
+| 6 × 4 | 13.0 / 57 ms | 8.1k RPS |
+| 12 × 4 | 12.0 / 107 ms | 9.6k RPS |
 
 ## Benchmarks
 
@@ -245,7 +254,7 @@ With every thread started before the first call, stock ext-grpc hung 0 of 15 tim
 ## Production checklist
 
 - Enable `ext-grpc`, and `ext-protobuf` for the lowest overhead.
-- Use a PHP build with the [native fix](#native-fix) if you can.
+- Use a PHP build with the [native fix](#native-fix) if you can, [TrixNEW/ext-grpc](https://github.com/TrixNEW/ext-grpc) has it.
 - Keep `batchSize` at 1 unless that build has the fix.
 - Use TLS or mTLS for traffic over an untrusted network.
 - Keep deadlines short so shutdown and failure recovery stay bounded.

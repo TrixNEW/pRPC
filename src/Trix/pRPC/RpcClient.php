@@ -18,6 +18,7 @@ use Trix\pRPC\retry\RpcRetryPolicy;
 use Trix\pRPC\retry\RpcStatus;
 use Trix\pRPC\stats\RpcClientStats;
 use Trix\pRPC\stats\RpcLatency;
+use Trix\pRPC\thread\GrpcGate;
 use Trix\pRPC\thread\GrpcWorkerThread;
 use Trix\pRPC\utils\exception\RpcClosedException;
 use Trix\pRPC\utils\exception\RpcException;
@@ -95,7 +96,7 @@ final class RpcClient{
 
         $this->ownsPool = $owner instanceof PluginBase;
         $this->pool = $owner instanceof PluginBase
-            ? new RpcWorkerPool($owner, min($config->workers, RpcWorkerPool::MAX_WORKERS), $config->maxOutstanding, $config->maxQueuedBytes)
+            ? new RpcWorkerPool($owner, min($config->workers, GrpcGate::maxWorkers()), $config->maxOutstanding, $config->maxQueuedBytes)
             : $owner;
 
         try{

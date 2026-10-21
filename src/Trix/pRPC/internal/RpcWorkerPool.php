@@ -28,7 +28,6 @@ use Trix\pRPC\thread\RpcLane;
  * @internal
  */
 final class RpcWorkerPool{
-    public const int MAX_WORKERS = GrpcGate::MAX_CALLS;
     // gRPC enforces each call's deadline, so a worker this far past its latest one is never coming back
     private const int STUCK_GRACE_NS = 2_000_000_000;
     private const int WATCHDOG_EVERY_TICKS = 10;
@@ -71,7 +70,8 @@ final class RpcWorkerPool{
     private int $lostWorkers = 0;
     private int $ticks = 0;
     private bool $closed = false;
-    private bool $manageAsync = true;
+    private readonly bool $gated;
+    private bool $manageAsync;
     private int $nextKeepAsyncNs = 0;
 
     public function __construct(
@@ -80,8 +80,9 @@ final class RpcWorkerPool{
         public readonly int $maxOutstanding,
         public readonly int $maxQueuedBytes
     ){
-        if($size < 1 || $size > self::MAX_WORKERS){
-            throw new InvalidArgumentException('A worker pool needs between 1 and ' . self::MAX_WORKERS . ' workers.');
+        $maxWorkers = GrpcGate::maxWorkers();
+        if($size < 1 || $size > $maxWorkers){
+            throw new InvalidArgumentException("A worker pool needs between 1 and $maxWorkers workers.");
         }
         if($maxOutstanding < 1 || $maxQueuedBytes < 1){
             throw new InvalidArgumentException('Pool limits must be greater than 0.');
@@ -91,6 +92,7 @@ final class RpcWorkerPool{
         $this->asyncPool = $plugin->getServer()->getAsyncPool();
         $this->queue = new RpcDispatchQueue();
         $this->gate = GrpcGate::get();
+        $this->gated = $this->manageAsync = GrpcGate::needed();
         $this->gateOwner = GrpcGate::newKey($this->gate);
         $this->pendingSpawns = $size;
         try{
@@ -298,7 +300,7 @@ final class RpcWorkerPool{
         if($this->pendingSpawns === 0 && !$this->asyncMissing()){
             return true;
         }
-        if($this->closed || hrtime(true) < $this->nextSpawnNs || !GrpcGate::trySpawn($this->gate, $this->gateOwner)){
+        if($this->closed || hrtime(true) < $this->nextSpawnNs || ($this->gated && !GrpcGate::trySpawn($this->gate, $this->gateOwner))){
             return false;
         }
         $spawned = false;

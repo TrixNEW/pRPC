@@ -162,7 +162,28 @@ $tests['more than 6 workers across clients never overrun ext-grpc'] = static fun
     $check($log->ok === 2_000 && $log->wrong === 0, json_encode($log));
 };
 
-$tests['down, blackhole and flapping backends fail the way they should'] = static function() use ($config, $send, $until, $check) : void{
+$tests['a queue per thread lifts the 6 worker limit'] = static function() use ($config, $send, $until, $check) : void{
+    if(!defined('Grpc\PER_THREAD_COMPLETION_QUEUE')){
+        echo "  skipped, stock ext-grpc\n";
+        return;
+    }
+    $manager = new RpcClientManager(Bench::$plugin, workers: 12);
+    $client = $manager->register('a', $config(50100, ['workers' => 12, 'batchSize' => 4, 'defaultTimeoutMs' => 5_000]));
+    $log = new Log();
+    $start = hrtime(true);
+    for($i = 0; $i < 480; ++$i){
+        $send($client, "w$i", $log);
+    }
+    $until($log->settled(...), 10);
+    $ms = (hrtime(true) - $start) / 1e6;
+    $threads = $manager->threadCount();
+    $manager->close();
+    $check($threads === 12 && $log->ok === 480 && $log->wrong === 0, json_encode($log));
+    // 480 calls of 200ms take 2s on 48 at once, 4s if only 6 workers could wait
+    $check($ms < 3_500, "took {$ms}ms");
+};
+
+$tests['down, blackhole and flapping backends fail the way they should'] =static function() use ($config, $send, $until, $check) : void{
     $manager = new RpcClientManager(Bench::$plugin, workers: 4);
     $down = $manager->register('down', $config(50199, ['workers' => 1]));
     $dead = $manager->register('dead', $config(50101, ['workers' => 1, 'defaultTimeoutMs' => 300]));
