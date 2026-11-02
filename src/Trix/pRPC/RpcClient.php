@@ -7,7 +7,7 @@ namespace Trix\pRPC;
 use Closure;
 use Google\Protobuf\Internal\Message;
 use InvalidArgumentException;
-use pocketmine\plugin\PluginBase;
+use quark\plugin\PluginBase;
 use RuntimeException;
 use Throwable;
 use Trix\pRPC\internal\RpcWorkerPool;
@@ -119,7 +119,7 @@ final class RpcClient{
     }
 
     /**
-     * Executes a registered unary RPC without blocking the PocketMine main thread.
+     * Executes a registered unary RPC without blocking the Quark main thread.
      * The request is encoded once on the main thread and the response is decoded once on the main thread.
      *
      * @template TRequest of Message

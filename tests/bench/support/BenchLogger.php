@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace pRPCBench;
 
-use pocketmine\thread\log\ThreadSafeLogger;
+use quark\thread\log\ThreadSafeLogger;
 
 /** Prints warnings and worse, the AsyncPool needs a logger its workers can share. */
 final class BenchLogger extends ThreadSafeLogger{

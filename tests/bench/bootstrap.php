@@ -2,26 +2,26 @@
 
 declare(strict_types=1);
 
-// Boots just enough of PocketMine to run pRPC outside a server.
-// PRPC_PM points at a PocketMine-MP checkout with vendor/, PRPC_SRC at the pRPC src to load (defaults to this repo).
+// Boots just enough of Quark to run pRPC outside a server.
+// PRPC_PM points at a Quark checkout with vendor/, PRPC_SRC at the pRPC src to load (defaults to this repo).
 // PRPC_TRANSPORT=grpc uses the real ext-grpc against examples/backend, anything else uses tests/bench/fake or PRPC_FAKE.
 
-use pocketmine\plugin\PluginBase;
-use pocketmine\scheduler\AsyncPool;
-use pocketmine\scheduler\TaskScheduler;
+use quark\plugin\PluginBase;
+use quark\scheduler\AsyncPool;
+use quark\scheduler\TaskScheduler;
 use pRPCBench\BenchLogger;
-use pocketmine\Server;
-use pocketmine\thread\ThreadSafeClassLoader;
-use pocketmine\TimeTrackingSleeperHandler;
-use pocketmine\timings\TimingsHandler;
+use quark\Server;
+use quark\thread\ThreadSafeClassLoader;
+use quark\TimeTrackingSleeperHandler;
+use quark\pulse\Pulse;
 
-$pm = getenv('PRPC_PM') ?: dirname(__DIR__, 3) . '/PocketMine';
+$pm = getenv('PRPC_PM') ?: dirname(__DIR__, 3) . '/Quark';
 $src = getenv('PRPC_SRC') ?: dirname(__DIR__, 2) . '/src/Trix/pRPC';
 $fake = getenv('PRPC_TRANSPORT') !== 'grpc';
 $fakeDir = getenv('PRPC_FAKE') ?: __DIR__ . '/fake/Grpc';
 
 if(!is_file($pm . '/vendor/autoload.php')){
-    fwrite(STDERR, "Set PRPC_PM to a PocketMine-MP checkout with composer dependencies installed.\n");
+    fwrite(STDERR, "Set PRPC_PM to a Quark checkout with composer dependencies installed.\n");
     exit(1);
 }
 require $pm . '/vendor/autoload.php';
@@ -53,7 +53,7 @@ final class Bench{
     public static int $heartbeatNs = 0;
 
     public static function boot(ThreadSafeClassLoader $loader) : void{
-        self::$sleeper = new TimeTrackingSleeperHandler(new TimingsHandler('pRPC bench'));
+        self::$sleeper = new TimeTrackingSleeperHandler(Pulse::zone('prpc.bench'));
         self::$scheduler = new TaskScheduler();
 
         $serverRef = new ReflectionClass(Server::class);
