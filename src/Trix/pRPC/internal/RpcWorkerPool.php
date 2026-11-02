@@ -52,6 +52,8 @@ final class RpcWorkerPool{
     private ?SleeperHandlerEntry $sleeperEntry = null;
     private ?TaskHandler $task = null;
     private readonly RpcDispatchQueue $queue;
+    /** @var ThreadSafeArray<int, string> */
+    private readonly ThreadSafeArray $results;
     /** @var ThreadSafeArray<string, mixed> */
     private readonly ThreadSafeArray $gate;
     private readonly int $gateOwner;
@@ -91,6 +93,7 @@ final class RpcWorkerPool{
         $this->sleeper = $plugin->getServer()->getTickSleeper();
         $this->asyncPool = $plugin->getServer()->getAsyncPool();
         $this->queue = new RpcDispatchQueue();
+        $this->results = $this->queue->results;
         $this->gate = GrpcGate::get();
         $this->gated = $this->manageAsync = GrpcGate::needed();
         $this->gateOwner = GrpcGate::newKey($this->gate);
@@ -238,8 +241,9 @@ final class RpcWorkerPool{
     }
 
     public function drainResults() : void{
-        $results = $this->queue->results;
-        while(($frames = $results->chunk(256)) !== []){
+        // a short chunk took everything, and whatever lands after it finds the array empty and wakes us again
+        do{
+            $frames = $this->results->chunk(256);
             foreach($frames as $frame){
                 if(!is_string($frame) || strlen($frame) < GrpcWorkerThread::RESULT_HEADER_BYTES){
                     continue;
@@ -248,7 +252,7 @@ final class RpcWorkerPool{
                 $client = $this->clients[$h['endpoint']] ?? null;
                 $client?->onResult($h['id'], $h['code'], $h['wait'], substr($frame, GrpcWorkerThread::RESULT_HEADER_BYTES));
             }
-        }
+        }while(count($frames) === 256);
     }
 
     private function watchdog(int $now) : void{
