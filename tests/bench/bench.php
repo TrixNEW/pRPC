@@ -103,7 +103,7 @@ for($rep = 1; $rep <= $reps; ++$rep){
     $done = 0;
     $callNs = 0;
     $send = static function(string $name, RpcClient $c) use ($method, &$lat, &$errors, &$sent, &$done, &$callNs) : void{
-        $req = new StringValue(['value' => str_repeat('x', 64)]);
+        $req = new StringValue(['value' => str_repeat('x', (int) (getenv('PRPC_PAYLOAD') ?: 64))]);
         $t = hrtime(true);
         ++$sent;
         $promise = $c->call($method, $req);
