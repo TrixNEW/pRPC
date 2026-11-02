@@ -3,13 +3,13 @@
 declare(strict_types=1);
 
 // Runs real worker threads against the fake transport in tests/bench/fake.
-// Needs a PHP build with pmmpthread and a PocketMine-MP checkout: PRPC_PM=/path/to/PocketMine-MP php tests/threads.php
+// Needs a PHP build with pmmpthread and a Quark checkout: PRPC_PM=/path/to/Quark php tests/threads.php
 
 require __DIR__ . '/bench/bootstrap.php';
 
 use Google\Protobuf\StringValue;
 use pmmp\thread\Thread as NativeThread;
-use pocketmine\thread\ThreadManager;
+use quark\thread\ThreadManager;
 use Trix\pRPC\opts\RpcClientConfig;
 use Trix\pRPC\opts\RpcCredentials;
 use Trix\pRPC\RpcClient;
@@ -415,7 +415,7 @@ $tests['20000 pending calls on a dead backend all time out and free their slots'
     $check($grew < 256 * 1024, "memory grew by $grew bytes over three more rounds");
 };
 
-$tests['every PocketMine async worker is started up front'] = static function() use ($check) : void{
+$tests['every Quark async worker is started up front'] = static function() use ($check) : void{
     $async = Bench::$plugin->getServer()->getAsyncPool();
     $manager = Open::add(new RpcClientManager(Bench::$plugin, workers: 1));
     $check(count($async->getRunningWorkers()) === $async->getSize(), 'async workers left to start on demand');

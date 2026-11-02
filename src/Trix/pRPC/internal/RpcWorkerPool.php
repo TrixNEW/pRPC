@@ -6,10 +6,10 @@ namespace Trix\pRPC\internal;
 
 use InvalidArgumentException;
 use pmmp\thread\ThreadSafeArray;
-use pocketmine\plugin\PluginBase;
-use pocketmine\scheduler\AsyncPool;
-use pocketmine\scheduler\ClosureTask;
-use pocketmine\scheduler\TaskHandler;
+use quark\plugin\PluginBase;
+use quark\scheduler\AsyncPool;
+use quark\scheduler\ClosureTask;
+use quark\scheduler\TaskHandler;
 use pocketmine\snooze\SleeperHandler;
 use pocketmine\snooze\SleeperHandlerEntry;
 use RuntimeException;
@@ -36,7 +36,7 @@ final class RpcWorkerPool{
     private const int RESPAWN_EVERY_NS = 1_000_000_000;
     // a hung thread never exits and holds its memory, past this many lost ones are no longer replaced
     private const int MAX_HUNG_THREADS = 16;
-    // PocketMine stops async workers idle for 5 minutes, wall time so a lagging server still makes it
+    // Quark stops async workers idle for 5 minutes, wall time so a lagging server still makes it
     private const int KEEP_ASYNC_EVERY_NS = 120_000_000_000;
 
     /**
@@ -325,7 +325,7 @@ final class RpcWorkerPool{
         return $this->manageAsync && count($this->asyncPool->getRunningWorkers()) < $this->asyncPool->getSize();
     }
 
-    /** Started now so PocketMine doesn't start them on demand while calls are in flight. */
+    /** Started now so Quark doesn't start them on demand while calls are in flight. */
     private function startAsyncWorkers() : bool{
         $started = false;
         try{

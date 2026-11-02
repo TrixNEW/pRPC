@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace Trix\pRPC;
 
 use InvalidArgumentException;
-use pocketmine\plugin\PluginBase;
+use quark\plugin\PluginBase;
 use Trix\pRPC\internal\RpcWorkerPool;
 use Trix\pRPC\opts\RpcClientConfig;
 use Trix\pRPC\stats\RpcClientStats;

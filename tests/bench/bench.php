@@ -8,7 +8,7 @@ declare(strict_types=1);
 require __DIR__ . '/bootstrap.php';
 
 use Google\Protobuf\StringValue;
-use pocketmine\thread\ThreadManager;
+use quark\thread\ThreadManager;
 use Trix\pRPC\opts\RpcClientConfig;
 use Trix\pRPC\RpcClient;
 use Trix\pRPC\RpcClientManager;

@@ -3,7 +3,7 @@
 declare(strict_types=1);
 
 // Runs real worker threads against real ext-grpc and examples/backend (go run . in examples/backend).
-// PRPC_PM=/path/to/PocketMine-MP php tests/grpc.php [filter]
+// PRPC_PM=/path/to/Quark php tests/grpc.php [filter]
 
 putenv('PRPC_TRANSPORT=grpc');
 require __DIR__ . '/bench/bootstrap.php';
@@ -223,7 +223,7 @@ foreach($tests as $name => $test){
 }
 echo count($tests), " grpc tests, $failures failures\n";
 if(Hung::$threads > 0 && function_exists('posix_kill')){
-    // a stuck thread can't be joined, so end the way PocketMine does
+    // a stuck thread can't be joined, so end the way Quark does
     echo 'killing the process to get past ', Hung::$threads, " stuck worker(s)\n";
     posix_kill(getmypid(), $failures === 0 ? SIGTERM : SIGKILL);
 }
