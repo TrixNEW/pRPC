@@ -19,7 +19,7 @@ pRPC executes gRPC calls on worker threads, keeping network operations off the m
 - Quark 6 (plugin API `6.0.0`) on PHP 8.4+ with `pmmpthread` (Quark's binaries ship qthreads)
 - `ext-grpc` (not included in Quark's binaries)
 - `google/protobuf ^4.31 || ^5.0`
-- `ext-protobuf` (recommended for optimal performance)
+- `ext-protobuf` (recommended, not in Quark's binaries. Without it a 16 KB request costs ~0.8 ms of main thread time to encode)
 
 > **Recommended:** Use [TrixNEW/ext-grpc](https://github.com/TrixNEW/ext-grpc), a patched version of ext-grpc 1.74.0 that fixes completion queue issues affecting multithreaded PHP applications.
 >

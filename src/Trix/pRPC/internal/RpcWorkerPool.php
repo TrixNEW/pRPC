@@ -6,12 +6,12 @@ namespace Trix\pRPC\internal;
 
 use InvalidArgumentException;
 use pmmp\thread\ThreadSafeArray;
+use pocketmine\snooze\SleeperHandler;
+use pocketmine\snooze\SleeperHandlerEntry;
 use quark\plugin\PluginBase;
 use quark\scheduler\AsyncPool;
 use quark\scheduler\ClosureTask;
 use quark\scheduler\TaskHandler;
-use pocketmine\snooze\SleeperHandler;
-use pocketmine\snooze\SleeperHandlerEntry;
 use RuntimeException;
 use Throwable;
 use Trix\pRPC\RpcClient;
