@@ -9,7 +9,7 @@
     "google/protobuf": "^4.31 || ^5.0"
   },
   "suggest": {
-    "ext-protobuf": "Recommended for the fastest protobuf implementation."
+    "ext-protobuf": "Encodes and decodes on the main thread around 100x faster than the pure PHP runtime, see github.com/TrixNEW/ext-protobuf."
   },
   "autoload": {
     "psr-4": {
