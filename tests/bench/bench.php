@@ -8,7 +8,7 @@ declare(strict_types=1);
 require __DIR__ . '/bootstrap.php';
 
 use Google\Protobuf\StringValue;
-use pocketmine\thread\ThreadManager;
+use quark\thread\ThreadManager;
 use Trix\pRPC\opts\RpcClientConfig;
 use Trix\pRPC\RpcClient;
 use Trix\pRPC\RpcClientManager;
@@ -103,7 +103,7 @@ for($rep = 1; $rep <= $reps; ++$rep){
     $done = 0;
     $callNs = 0;
     $send = static function(string $name, RpcClient $c) use ($method, &$lat, &$errors, &$sent, &$done, &$callNs) : void{
-        $req = new StringValue(['value' => str_repeat('x', 64)]);
+        $req = new StringValue(['value' => str_repeat('x', (int) (getenv('PRPC_PAYLOAD') ?: 64))]);
         $t = hrtime(true);
         ++$sent;
         $promise = $c->call($method, $req);

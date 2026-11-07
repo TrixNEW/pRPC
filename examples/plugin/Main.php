@@ -8,7 +8,7 @@ use Example\Data\GetPlayerRequest;
 use Example\Data\GetPlayerResponse;
 use Example\Data\SavePlayerRequest;
 use Example\Data\SavePlayerResponse;
-use pocketmine\plugin\PluginBase;
+use quark\plugin\PluginBase;
 use Throwable;
 use Trix\pRPC\opts\RpcCallOptions;
 use Trix\pRPC\opts\RpcClientConfig;

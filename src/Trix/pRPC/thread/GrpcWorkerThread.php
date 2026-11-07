@@ -11,8 +11,8 @@ use Grpc\Timeval;
 use pmmp\thread\ThreadSafeArray;
 use pocketmine\snooze\SleeperHandlerEntry;
 use pocketmine\snooze\SleeperNotifier;
-use pocketmine\thread\Thread;
-use pocketmine\thread\ThreadException;
+use quark\thread\Thread;
+use quark\thread\ThreadException;
 use RuntimeException;
 use Throwable;
 use Trix\pRPC\retry\RpcStatus;
@@ -118,7 +118,7 @@ final class GrpcWorkerThread extends Thread{
 
     public function quit() : void{
         if($this->isRunning()){
-            // joining blocks for good on a thread stuck in ext-grpc, failing lets PocketMine finish shutting down
+            // joining blocks for good on a thread stuck in ext-grpc, failing lets Quark finish shutting down
             if($this->synchronized(fn() : bool => $this->hung)){
                 throw new ThreadException('pRPC worker ' . $this->workerId . ' is stuck inside ext-grpc and cannot be joined.');
             }

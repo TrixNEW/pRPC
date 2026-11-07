@@ -6,12 +6,12 @@ namespace Trix\pRPC\internal;
 
 use InvalidArgumentException;
 use pmmp\thread\ThreadSafeArray;
-use pocketmine\plugin\PluginBase;
-use pocketmine\scheduler\AsyncPool;
-use pocketmine\scheduler\ClosureTask;
-use pocketmine\scheduler\TaskHandler;
 use pocketmine\snooze\SleeperHandler;
 use pocketmine\snooze\SleeperHandlerEntry;
+use quark\plugin\PluginBase;
+use quark\scheduler\AsyncPool;
+use quark\scheduler\ClosureTask;
+use quark\scheduler\TaskHandler;
 use RuntimeException;
 use Throwable;
 use Trix\pRPC\RpcClient;
@@ -36,7 +36,7 @@ final class RpcWorkerPool{
     private const int RESPAWN_EVERY_NS = 1_000_000_000;
     // a hung thread never exits and holds its memory, past this many lost ones are no longer replaced
     private const int MAX_HUNG_THREADS = 16;
-    // PocketMine stops async workers idle for 5 minutes, wall time so a lagging server still makes it
+    // Quark stops async workers idle for 5 minutes, wall time so a lagging server still makes it
     private const int KEEP_ASYNC_EVERY_NS = 120_000_000_000;
 
     /**
@@ -52,6 +52,8 @@ final class RpcWorkerPool{
     private ?SleeperHandlerEntry $sleeperEntry = null;
     private ?TaskHandler $task = null;
     private readonly RpcDispatchQueue $queue;
+    /** @var ThreadSafeArray<int, string> */
+    private readonly ThreadSafeArray $results;
     /** @var ThreadSafeArray<string, mixed> */
     private readonly ThreadSafeArray $gate;
     private readonly int $gateOwner;
@@ -91,6 +93,7 @@ final class RpcWorkerPool{
         $this->sleeper = $plugin->getServer()->getTickSleeper();
         $this->asyncPool = $plugin->getServer()->getAsyncPool();
         $this->queue = new RpcDispatchQueue();
+        $this->results = $this->queue->results;
         $this->gate = GrpcGate::get();
         $this->gated = $this->manageAsync = GrpcGate::needed();
         $this->gateOwner = GrpcGate::newKey($this->gate);
@@ -238,8 +241,9 @@ final class RpcWorkerPool{
     }
 
     public function drainResults() : void{
-        $results = $this->queue->results;
-        while(($frames = $results->chunk(256)) !== []){
+        // a short chunk took everything, and whatever lands after it finds the array empty and wakes us again
+        do{
+            $frames = $this->results->chunk(256);
             foreach($frames as $frame){
                 if(!is_string($frame) || strlen($frame) < GrpcWorkerThread::RESULT_HEADER_BYTES){
                     continue;
@@ -248,7 +252,7 @@ final class RpcWorkerPool{
                 $client = $this->clients[$h['endpoint']] ?? null;
                 $client?->onResult($h['id'], $h['code'], $h['wait'], substr($frame, GrpcWorkerThread::RESULT_HEADER_BYTES));
             }
-        }
+        }while(count($frames) === 256);
     }
 
     private function watchdog(int $now) : void{
@@ -325,7 +329,7 @@ final class RpcWorkerPool{
         return $this->manageAsync && count($this->asyncPool->getRunningWorkers()) < $this->asyncPool->getSize();
     }
 
-    /** Started now so PocketMine doesn't start them on demand while calls are in flight. */
+    /** Started now so Quark doesn't start them on demand while calls are in flight. */
     private function startAsyncWorkers() : bool{
         $started = false;
         try{

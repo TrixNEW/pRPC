@@ -4,10 +4,10 @@ declare(strict_types=1);
 
 namespace Trix\pRPC\internal;
 
-use pocketmine\scheduler\AsyncTask;
+use quark\scheduler\AsyncTask;
 
 /**
- * Keeps a PocketMine async worker from being stopped as idle, a replacement thread would swap ext-grpc's completion
+ * Keeps a Quark async worker from being stopped as idle, a replacement thread would swap ext-grpc's completion
  * queue under calls in flight.
  *
  * @internal

@@ -1,6 +1,6 @@
 # pRPC
 
-High-performance asynchronous gRPC client for **PocketMine-MP**, designed for low-overhead communication with databases and external services.
+High-performance asynchronous gRPC client for **Quark**, designed for low-overhead communication with databases and external services.
 
 pRPC executes gRPC calls on worker threads, keeping network operations off the main server thread while delivering responses through callbacks.
 
@@ -16,17 +16,16 @@ pRPC executes gRPC calls on worker threads, keeping network operations off the m
 
 ## Requirements
 
-- PHP 8.4+ with `pmmpthread`
-- PocketMine-MP API 5.x
-- `ext-grpc`
+- Quark 6 (plugin API `6.0.0`) on PHP 8.4+ with `pmmpthread` (Quark's binaries ship qthreads)
+- `ext-grpc` (not included in Quark's binaries)
 - `google/protobuf ^4.31 || ^5.0`
-- `ext-protobuf` (recommended for optimal performance)
+- `ext-protobuf`, strongly recommended. Use [TrixNEW/ext-protobuf](https://github.com/TrixNEW/ext-protobuf), tested on threads. Without it a 16 KB request takes about 0.5 ms of main thread time to encode, with it about 5 µs
 
 > **Recommended:** Use [TrixNEW/ext-grpc](https://github.com/TrixNEW/ext-grpc), a patched version of ext-grpc 1.74.0 that fixes completion queue issues affecting multithreaded PHP applications.
 >
 > The fork provides per-thread completion queues, avoiding the shared queue's six-call limit and thread-related hangs or crashes. It also enables higher concurrency and safe request pipelining in pRPC. Stock ext-grpc remains supported with additional safeguards and reduced concurrency.
 
-**Compatibility:** Quark 6 requires a namespace migration before pRPC can be used directly.
+**Compatibility:** PocketMine-MP 5 is supported up to pRPC v0.2.x.
 
 ## Installation
 
@@ -128,7 +127,7 @@ php tests/threads.php
 php tests/grpc.php
 ```
 
-Threaded and integration tests require the appropriate PocketMine-MP, pmmpthread, and gRPC environments.
+Threaded and integration tests require the appropriate Quark, pmmpthread, and gRPC environments.
 
 ## License
 
