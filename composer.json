@@ -1,5 +1,5 @@
 {
-  "name": "trix/prpc",
+  "name": "trixnew/prpc",
   "description": "High-performance asynchronous gRPC transport for PocketMine/Quark.",
   "license": "Apache-2.0",
   "type": "library",
