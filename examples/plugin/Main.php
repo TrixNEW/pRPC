@@ -59,7 +59,7 @@ final class Main extends PluginBase{
             $coins = $response->getCoins();
 
             $this->getLogger()->info("Loaded {$name} with {$coins} coins");
-        })->onError(function(Throwable $error) : void{
+        }, function(Throwable $error) : void{
             $this->getLogger()->error("Failed to load player: " . $error->getMessage());
         });
     }
@@ -84,7 +84,7 @@ final class Main extends PluginBase{
             if(!$response->getSuccess()){
                 $this->getLogger()->warning("Player save was rejected");
             }
-        })->onError(function(Throwable $error) : void{
+        }, function(Throwable $error) : void{
             $this->getLogger()->error("Failed to save player: " . $error->getMessage());
         });
     }

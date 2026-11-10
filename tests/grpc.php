@@ -57,7 +57,7 @@ $send = static function(RpcClient $client, string $value, Log $log) use ($echo) 
         if($r->getValue() !== $value){
             ++$log->wrong;
         }
-    })->onError(static function(Throwable $e) use ($log) : void{
+    }, static function(Throwable $e) use ($log) : void{
         $key = (new ReflectionClass($e))->getShortName() . ($e instanceof RpcException ? ':' . $e->getStatusCode() : '');
         $log->err[$key] = ($log->err[$key] ?? 0) + 1;
     });

@@ -111,7 +111,7 @@ for($rep = 1; $rep <= $reps; ++$rep){
         $promise->then(static function() use ($name, $t, &$lat, &$done) : void{
             $lat[$name][] = (hrtime(true) - $t) / 1e6;
             ++$done;
-        })->onError(static function(Throwable $e) use ($name, &$errors, &$done) : void{
+        }, static function(Throwable $e) use ($name, &$errors, &$done) : void{
             $key = $name . ':' . (new ReflectionClass($e))->getShortName();
             $errors[$key] = ($errors[$key] ?? 0) + 1;
             ++$done;

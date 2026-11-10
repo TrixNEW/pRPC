@@ -7,50 +7,65 @@ namespace Trix\pRPC\retry;
 use Closure;
 use Throwable;
 use Trix\pRPC\utils\exception\RpcClosedException;
-use Trix\pRPC\utils\promise\RpcPromise;
-use Trix\pRPC\utils\promise\RpcPromiseResolver;
+use Vow\Deferred;
+use Vow\Promise;
 
 /** @internal */
 final class RpcRetrier{
-    /** @var array<int, array{dueNs: int, run: Closure(): void}> */
+    /** @var array<int, array{Deferred<mixed>, ?Promise<mixed>}> run => its deferred and the attempt in flight */
+    private array $runs = [];
+    /** @var array<int, array{dueNs: int, run: Closure(): void}> run => its next attempt */
     private array $timers = [];
-    private int $nextTimer = 0;
+    private int $nextRun = 0;
     private int $retries = 0;
     private bool $stopped = false;
 
     /**
      * @param Closure(Throwable): void $callbackErrorHandler
      * @param Closure(): int $clockNs
+     * @param Closure(Promise<mixed>): bool $cancelAttempt
      */
     public function __construct(
         private readonly Closure $callbackErrorHandler,
-        private readonly Closure $clockNs
+        private readonly Closure $clockNs,
+        private readonly Closure $cancelAttempt
     ){}
 
     /**
      * @template T
-     * @param Closure(): RpcPromise<T> $attempt
+     * @param Closure(): Promise<T> $attempt
      * @param ?Closure(Throwable, int): void $onRetry
-     * @return RpcPromise<T>
+     * @return Promise<T>
      */
-    public function run(Closure $attempt, RpcRetryPolicy $policy, ?Closure $onRetry = null) : RpcPromise{
-        $resolver = new RpcPromiseResolver($this->callbackErrorHandler);
+    public function run(Closure $attempt, RpcRetryPolicy $policy, ?Closure $onRetry = null) : Promise{
+        /** @var Deferred<T> $deferred */
+        $deferred = new Deferred();
+        $run = $this->nextRun++;
+        $this->runs[$run] = [$deferred, null];
         $giveUpNs = $policy->totalTimeoutMs === null ? PHP_INT_MAX : ($this->clockNs)() + $policy->totalTimeoutMs * 1_000_000;
-        $this->attempt($attempt, $policy, $onRetry, $resolver, 1, 0, $giveUpNs);
-        return $resolver->promise();
+        $this->attempt($run, $attempt, $policy, $onRetry, 1, 0, $giveUpNs);
+        return $deferred->promise;
     }
 
-    /** @param RpcPromiseResolver<mixed> $resolver */
-    private function attempt(Closure $attempt, RpcRetryPolicy $policy, ?Closure $onRetry, RpcPromiseResolver $resolver, int $n, int $uncertain, int $giveUpNs) : void{
+    private function attempt(int $run, Closure $attempt, RpcRetryPolicy $policy, ?Closure $onRetry, int $n, int $uncertain, int $giveUpNs) : void{
+        // a callback can cancel a run while its timer is already being fired
+        if(!isset($this->runs[$run])){
+            return;
+        }
         try{
             $promise = $attempt();
         }catch(Throwable $e){
-            $resolver->reject($e);
+            $this->finish($run, false, $e);
             return;
         }
-        $promise
-            ->then(static fn(mixed $value) => $resolver->resolve($value))
-            ->onError(function(Throwable $e) use ($attempt, $policy, $onRetry, $resolver, $n, $uncertain, $giveUpNs) : void{
+        $this->runs[$run][1] = $promise;
+        $promise->observe(
+            fn(mixed $value) => $this->finish($run, true, $value),
+            function(Throwable $e) use ($run, $attempt, $policy, $onRetry, $n, $uncertain, $giveUpNs) : void{
+                if(!isset($this->runs[$run])){
+                    return;
+                }
+                $this->runs[$run][1] = null;
                 $ambiguous = RpcStatus::isAmbiguous($e);
                 // usually final, so these only get a few extra tries
                 $uncertainRetry = $ambiguous && !RpcStatus::isRetryable($e) && !$e instanceof RpcClosedException;
@@ -63,7 +78,7 @@ final class RpcRetrier{
                     && ($uncertainRetry ? $uncertain < $policy->maxUncertainAttempts : RpcStatus::isRetryable($e));
                 $dueNs = $retry ? ($this->clockNs)() + $policy->delayMs($n) * 1_000_000 : 0;
                 if(!$retry || $dueNs > $giveUpNs){
-                    $resolver->reject($e);
+                    $this->finish($run, false, $e);
                     return;
                 }
                 ++$this->retries;
@@ -74,11 +89,45 @@ final class RpcRetrier{
                         ($this->callbackErrorHandler)($hookError);
                     }
                 }
-                $this->timers[$this->nextTimer++] = [
+                $this->timers[$run] = [
                     'dueNs' => $dueNs,
-                    'run' => fn() => $this->attempt($attempt, $policy, $onRetry, $resolver, $n + 1, $uncertain, $giveUpNs),
+                    'run' => fn() => $this->attempt($run, $attempt, $policy, $onRetry, $n + 1, $uncertain, $giveUpNs),
                 ];
-            });
+            }
+        );
+    }
+
+    private function finish(int $run, bool $fulfilled, mixed $result) : void{
+        $deferred = ($this->runs[$run] ?? null)[0] ?? null;
+        if($deferred === null){
+            return;
+        }
+        unset($this->runs[$run]);
+        try{
+            $fulfilled ? $deferred->resolve($result) : $deferred->reject($result);
+        }catch(Throwable $e){
+            ($this->callbackErrorHandler)($e);
+        }
+    }
+
+    /** @param Promise<mixed> $promise */
+    public function cancel(Promise $promise) : bool{
+        foreach($this->runs as $run => [$deferred, $inFlight]){
+            if($deferred->promise !== $promise){
+                continue;
+            }
+            unset($this->runs[$run], $this->timers[$run]);
+            try{
+                if($inFlight !== null){
+                    ($this->cancelAttempt)($inFlight);
+                }
+                $deferred->cancel();
+            }catch(Throwable $e){
+                ($this->callbackErrorHandler)($e);
+            }
+            return true;
+        }
+        return false;
     }
 
     public function tick() : void{
@@ -86,11 +135,11 @@ final class RpcRetrier{
             return;
         }
         $now = ($this->clockNs)();
-        foreach($this->timers as $id => $timer){
+        foreach($this->timers as $run => $timer){
             if($timer['dueNs'] > $now){
                 continue;
             }
-            unset($this->timers[$id]);
+            unset($this->timers[$run]);
             ($timer['run'])();
         }
     }

@@ -21,6 +21,8 @@ use Trix\pRPC\utils\exception\RpcException;
 use Trix\pRPC\utils\exception\RpcOverloadedException;
 use Trix\pRPC\utils\exception\RpcTimeoutException;
 use Trix\pRPC\utils\exception\RpcWorkerException;
+use Vow\CancelledException;
+use Vow\Promise;
 
 $echo = new RpcMethod('/test.Echo/Call', StringValue::class, StringValue::class);
 $other = new RpcMethod('/test.Other/Call', StringValue::class, StringValue::class);
@@ -86,7 +88,7 @@ $send = static function(RpcClient $client, string $value, CallLog $log, ?RpcMeth
         if(NativeThread::getCurrentThread() !== null){
             ++$log->offThread;
         }
-    })->onError(static function(Throwable $e) use ($value, $log) : void{
+    }, static function(Throwable $e) use ($value, $log) : void{
         ++$log->settled[$value];
         $key = (new ReflectionClass($e))->getShortName() . ($e instanceof RpcException ? ':' . $e->getStatusCode() : '');
         $log->err[$key] = ($log->err[$key] ?? 0) + 1;
@@ -354,7 +356,7 @@ $tests['close with calls in flight settles each one once and stays within the gr
     $check(($log->err['RpcClosedException:1'] ?? 0) === 20 && $log->ok === 20, json_encode($log->err));
     $check($closeMs < 600, "close took {$closeMs}ms with a 200ms grace period");
     $late = 0;
-    $dead->call($echo, new StringValue())->onError(static function(Throwable $e) use (&$late) : void{
+    $dead->call($echo, new StringValue())->catch(static function(Throwable $e) use (&$late) : void{
         $late += $e instanceof RpcClosedException ? 1 : 100;
     });
     $check($late === 1, 'calls after close must reject with RpcClosedException');
@@ -398,7 +400,7 @@ $tests['20000 pending calls on a dead backend all time out and free their slots'
         $client = new RpcClient(Bench::$plugin, $config('mode=blackhole', ['maxOutstanding' => 30_000, 'defaultTimeoutMs' => 500]));
         $done = new CallLog();
         for($i = 0; $i < $calls; ++$i){
-            $client->call($echo, new StringValue(['value' => 'x']))->onError(static function(Throwable $e) use ($done) : void{
+            $client->call($echo, new StringValue(['value' => 'x']))->catch(static function(Throwable $e) use ($done) : void{
                 $e instanceof RpcTimeoutException || ($e instanceof RpcException && $e->getStatusCode() === 4) ? ++$done->ok : ++$done->wrong;
             });
         }
@@ -522,8 +524,7 @@ $tests['a long run keeps memory flat'] = static function() use ($config, $echo, 
             $client->call($echo, new StringValue(['value' => 'long']))
                 ->then(static function() use ($done) : void{
                     ++$done->ok;
-                })
-                ->onError(static function() use ($done) : void{
+                }, static function() use ($done) : void{
                     ++$done->wrong;
                 });
         }
@@ -559,6 +560,59 @@ $tests['repeated client creation and destruction leaves nothing behind'] =static
     gc_collect_cycles();
     $check($pRPCThreads() <= $threadsBefore, 'threads leaked');
     $check(memory_get_usage() - $memory < 512 * 1024, 'memory grew by ' . (memory_get_usage() - $memory) . ' bytes');
+};
+
+$tests['cancel settles once, frees the pending entry and drops the late result'] = static function() use ($config, $echo, $until, $check) : void{
+    $client = Open::add(new RpcClient(Bench::$plugin, $config('lat=200000', ['defaultTimeoutMs' => 5_000])));
+    $results = [];
+    $promise = $client->call($echo, new StringValue(['value' => 'c']));
+    $promise->then(static function() use (&$results) : void{
+        $results[] = 'ok';
+    }, static function(Throwable $e) use (&$results) : void{
+        $results[] = $e::class;
+    });
+    $check($client->cancel($promise) && !$client->cancel($promise), 'cancel must succeed exactly once');
+    $check($results === [CancelledException::class], 'cancel did not reject with CancelledException');
+    $check($client->pendingCount() === 0 && $client->outstandingCount() === 1, 'the worker should still own the call');
+    $until(static fn() : bool => $client->outstandingCount() === 0, 5);
+    $check($results === [CancelledException::class], 'the late result settled a cancelled call');
+    $check(!$client->cancel(Promise::resolved(1)), 'a foreign promise was cancelled');
+
+    $retrying = $client->callRetrying($echo, new StringValue(['value' => 'r']));
+    $check($client->cancel($retrying) && $retrying->reason() instanceof CancelledException, 'retrying call was not cancelled');
+    $check($client->pendingCount() === 0, 'the attempt in flight was left pending');
+    $until(static fn() : bool => $client->outstandingCount() === 0, 5);
+};
+
+$tests['a throwing observer does not lose other results from the same drain'] = static function() use ($config, $echo, $until, $check) : void{
+    $client = Open::add(new RpcClient(Bench::$plugin, $config('lat=20000', ['maxOutstanding' => 10_000, 'batchSize' => 16])));
+    $ok = 0;
+    for($i = 0; $i < 500; ++$i){
+        $promise = $client->call($echo, new StringValue(['value' => "o$i"]));
+        if($i % 100 === 0){
+            $promise->observe(static function() : void{
+                throw new RuntimeException('observer failed on purpose');
+            });
+        }
+        $promise->observe(static function() use (&$ok) : void{
+            ++$ok;
+        });
+    }
+    $until(static fn() : bool => $client->outstandingCount() === 0, 10);
+    $check($ok === 500 && $client->pendingCount() === 0, "$ok of 500 calls settled");
+};
+
+$tests['callbacks can chain further calls and fibers can await them'] = static function() use ($config, $echo, $until, $check) : void{
+    $client = Open::add(new RpcClient(Bench::$plugin, $config('lat=300')));
+    $chained = $client->call($echo, new StringValue(['value' => 'a']))
+        ->then(static fn(StringValue $r) : Promise => $client->call($echo, new StringValue(['value' => $r->getValue() . 'b'])))
+        ->then(static fn(StringValue $r) : string => $r->getValue() . 'c');
+    $awaited = Promise::async(static function() use ($client, $echo) : string{
+        $first = $client->call($echo, new StringValue(['value' => 'x']))->await();
+        return $client->call($echo, new StringValue(['value' => $first->getValue() . 'y']))->await()->getValue();
+    });
+    $until(static fn() : bool => !$chained->isPending() && !$awaited->isPending());
+    $check($chained->value() === 'abc' && $awaited->value() === 'xy', 'chained calls returned the wrong values');
 };
 
 $tests['every call slot comes back once background calls end'] = static function() use ($until) : void{

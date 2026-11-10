@@ -6,7 +6,8 @@
   "require": {
     "php": ">=8.4",
     "ext-grpc": "*",
-    "google/protobuf": "^4.31 || ^5.0"
+    "google/protobuf": "^4.31 || ^5.0",
+    "trixnew/vow": "^1.0.1"
   },
   "suggest": {
     "ext-protobuf": "Encodes and decodes on the main thread around 100x faster than the pure PHP runtime, see github.com/TrixNEW/ext-protobuf."
