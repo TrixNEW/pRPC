@@ -108,20 +108,18 @@ $test('retry delays grow, cap and stay inside the jitter band', static function(
     }
 });
 
-/** @return array{RpcRetrier, Closure(int): void, ArrayObject<int, Promise<mixed>>, ArrayObject<int, Throwable>} */
 $retrier = static function() : array{
     $now = 0;
     $cancelled = new ArrayObject();
     $errors = new ArrayObject();
     $r = new RpcRetrier(
         static function(Throwable $e) use ($errors) : void{ $errors[] = $e; },
-        static function() use (&$now) : int{ return $now; },
-        static function(Promise $p) use ($cancelled) : bool{ $cancelled[] = $p; return true; }
+        static function() use (&$now) : int{ return $now; }
     );
-    return [$r, static function(int $ms) use (&$now, $r) : void{ $now += $ms * 1_000_000; $r->tick(); }, $cancelled, $errors];
+    $cancelAttempt = static function(Promise $p) use ($cancelled) : bool{ $cancelled[] = $p; return true; };
+    return [$r, static function(int $ms) use (&$now, $r) : void{ $now += $ms * 1_000_000; $r->tick(); }, $cancelled, $errors, $cancelAttempt];
 };
 
-/** Outcomes settle at once, a null outcome stays pending and its deferred goes into $deferreds. */
 $attempts = static function(array $outcomes, int &$calls, ?ArrayObject $deferreds = null) : Closure{
     return static function() use (&$outcomes, &$calls, $deferreds) : Promise{
         ++$calls;
@@ -243,29 +241,29 @@ $test('stopping the retrier runs waiting retries immediately', static function()
 });
 
 $test('cancelling a retry run cancels its attempt in flight and ignores the late result', static function() use ($retrier, $attempts) : void{
-    [$r, , $cancelled] = $retrier();
+    [$r, , $cancelled, , $cancelAttempt] = $retrier();
     $calls = 0;
     $deferreds = new ArrayObject();
     $error = null;
     $promise = $r->run($attempts([null], $calls, $deferreds), new RpcRetryPolicy());
     $promise->catch(static function(Throwable $e) use (&$error) : void{ $error = $e; });
-    if(!$r->cancel($promise) || $r->cancel($promise)){
+    if(!$r->cancel($promise, $cancelAttempt) || $r->cancel($promise, $cancelAttempt)){
         throw new RuntimeException('Cancel was not exactly once.');
     }
     if(!$error instanceof CancelledException || count($cancelled) !== 1 || $cancelled[0] !== $deferreds[0]->promise){
         throw new RuntimeException('Cancel did not reject the run or reach the attempt in flight.');
     }
     $deferreds[0]->resolve('late');
-    if(!$promise->isRejected() || $calls !== 1 || $r->cancel(Promise::resolved(1))){
+    if(!$promise->isRejected() || $calls !== 1 || $r->cancel(Promise::resolved(1), $cancelAttempt)){
         throw new RuntimeException('Late result settled a cancelled run.');
     }
 });
 
 $test('cancelling a run waiting for its retry drops the timer', static function() use ($retrier, $attempts) : void{
-    [$r, $advance, $cancelled] = $retrier();
+    [$r, $advance, $cancelled, , $cancelAttempt] = $retrier();
     $calls = 0;
     $promise = $r->run($attempts([new RpcOverloadedException(1), 'ok'], $calls), new RpcRetryPolicy(baseDelayMs: 1, maxDelayMs: 1, jitter: 0.0));
-    if($r->waiting() !== 1 || !$r->cancel($promise) || $r->waiting() !== 0 || count($cancelled) !== 0){
+    if($r->waiting() !== 1 || !$r->cancel($promise, $cancelAttempt) || $r->waiting() !== 0 || count($cancelled) !== 0){
         throw new RuntimeException('Waiting retry was not dropped.');
     }
     $advance(10);
@@ -275,12 +273,12 @@ $test('cancelling a run waiting for its retry drops the timer', static function(
 });
 
 $test('a run cancelled by a callback during tick never sends again', static function() use ($retrier, $attempts) : void{
-    [$r, $advance] = $retrier();
+    [$r, $advance, , , $cancelAttempt] = $retrier();
     $calls = 0;
     $policy = new RpcRetryPolicy(maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1, jitter: 0.0);
     $second = null;
     $first = $r->run($attempts([new RpcOverloadedException(1), new RpcOverloadedException(1)], $calls), $policy);
-    $first->catch(static function() use ($r, &$second) : void{ $r->cancel($second); });
+    $first->catch(static function() use ($r, $cancelAttempt, &$second) : void{ $r->cancel($second, $cancelAttempt); });
     $second = $r->run($attempts([new RpcOverloadedException(1), 'ok'], $calls), $policy);
     $advance(1);
     if($calls !== 3 || !$second->reason() instanceof CancelledException || $r->waiting() !== 0){
@@ -299,6 +297,42 @@ $test('a throwing observer on the retry promise is reported, not lost', static f
     $deferreds[0]->resolve('ok');
     if(!$after || count($errors) !== 1 || $errors[0]->getMessage() !== 'observer' || $promise->value() !== 'ok'){
         throw new RuntimeException('Observer exception escaped or stopped later observers.');
+    }
+});
+
+$test('a stale retry timer never fires into a newer run that reuses its key', static function() use ($retrier, $attempts) : void{
+    [$r, $advance, , , $cancelAttempt] = $retrier();
+    $policy = new RpcRetryPolicy(maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1, jitter: 0.0);
+    $oldCalls = 0;
+    $newCalls = 0;
+    $pendingAttempt = $attempts(array_fill(0, 64, null), $newCalls, new ArrayObject());
+    $first = $r->run($attempts([new RpcOverloadedException(1), new RpcOverloadedException(1)], $oldCalls), $policy);
+    $old = $r->run($attempts([new RpcOverloadedException(1), 'stale'], $oldCalls), $policy);
+    $newer = [];
+    $reused = false;
+    $spare = new stdClass();
+    $first->catch(static function() use ($r, $cancelAttempt, $policy, $pendingAttempt, &$old, &$spare, &$newer, &$reused) : void{
+        $oldId = spl_object_id($old);
+        $r->cancel($old, $cancelAttempt);
+        // freed handles are reused last in first out, so the new deferred takes the spare's and its promise the old one
+        $old = null;
+        $spare = null;
+        for($i = 0; $i < 16 && !$reused; ++$i){
+            $newer[] = $promise = $r->run($pendingAttempt, $policy);
+            $reused = spl_object_id($promise) === $oldId;
+        }
+    });
+    $advance(1);
+    if(!$reused){
+        throw new RuntimeException('Could not get a new run onto the cancelled run\'s key.');
+    }
+    foreach($newer as $promise){
+        if(!$promise->isPending()){
+            throw new RuntimeException('A stale timer settled a newer run.');
+        }
+    }
+    if($oldCalls !== 3){
+        throw new RuntimeException("The cancelled run sent again: calls=$oldCalls");
     }
 });
 

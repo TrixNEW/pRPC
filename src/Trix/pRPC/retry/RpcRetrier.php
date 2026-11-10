@@ -12,23 +12,20 @@ use Vow\Promise;
 
 /** @internal */
 final class RpcRetrier{
-    /** @var array<int, array{Deferred<mixed>, ?Promise<mixed>}> run => its deferred and the attempt in flight */
+    /** @var array<int, array{Deferred<mixed>, ?Promise<mixed>}> */
     private array $runs = [];
-    /** @var array<int, array{dueNs: int, run: Closure(): void}> run => its next attempt */
+    /** @var array<int, array{dueNs: int, run: Closure(): void}> */
     private array $timers = [];
-    private int $nextRun = 0;
     private int $retries = 0;
     private bool $stopped = false;
 
     /**
      * @param Closure(Throwable): void $callbackErrorHandler
      * @param Closure(): int $clockNs
-     * @param Closure(Promise<mixed>): bool $cancelAttempt
      */
     public function __construct(
         private readonly Closure $callbackErrorHandler,
-        private readonly Closure $clockNs,
-        private readonly Closure $cancelAttempt
+        private readonly Closure $clockNs
     ){}
 
     /**
@@ -40,7 +37,7 @@ final class RpcRetrier{
     public function run(Closure $attempt, RpcRetryPolicy $policy, ?Closure $onRetry = null) : Promise{
         /** @var Deferred<T> $deferred */
         $deferred = new Deferred();
-        $run = $this->nextRun++;
+        $run = spl_object_id($deferred->promise);
         $this->runs[$run] = [$deferred, null];
         $giveUpNs = $policy->totalTimeoutMs === null ? PHP_INT_MAX : ($this->clockNs)() + $policy->totalTimeoutMs * 1_000_000;
         $this->attempt($run, $attempt, $policy, $onRetry, 1, 0, $giveUpNs);
@@ -48,10 +45,6 @@ final class RpcRetrier{
     }
 
     private function attempt(int $run, Closure $attempt, RpcRetryPolicy $policy, ?Closure $onRetry, int $n, int $uncertain, int $giveUpNs) : void{
-        // a callback can cancel a run while its timer is already being fired
-        if(!isset($this->runs[$run])){
-            return;
-        }
         try{
             $promise = $attempt();
         }catch(Throwable $e){
@@ -98,7 +91,7 @@ final class RpcRetrier{
     }
 
     private function finish(int $run, bool $fulfilled, mixed $result) : void{
-        $deferred = ($this->runs[$run] ?? null)[0] ?? null;
+        $deferred = $this->runs[$run][0] ?? null;
         if($deferred === null){
             return;
         }
@@ -110,37 +103,31 @@ final class RpcRetrier{
         }
     }
 
-    /** @param Promise<mixed> $promise */
-    public function cancel(Promise $promise) : bool{
-        foreach($this->runs as $run => [$deferred, $inFlight]){
-            if($deferred->promise !== $promise){
-                continue;
-            }
-            unset($this->runs[$run], $this->timers[$run]);
-            try{
-                if($inFlight !== null){
-                    ($this->cancelAttempt)($inFlight);
-                }
-                $deferred->cancel();
-            }catch(Throwable $e){
-                ($this->callbackErrorHandler)($e);
-            }
-            return true;
+    /**
+     * @param Promise<mixed> $promise
+     * @param Closure(Promise<mixed>): bool $cancelAttempt
+     */
+    public function cancel(Promise $promise, Closure $cancelAttempt) : bool{
+        $run = spl_object_id($promise);
+        if(!isset($this->runs[$run])){
+            return false;
         }
-        return false;
+        [$deferred, $inFlight] = $this->runs[$run];
+        unset($this->runs[$run], $this->timers[$run]);
+        if($inFlight !== null){
+            $cancelAttempt($inFlight);
+        }
+        try{
+            $deferred->cancel();
+        }catch(Throwable $e){
+            ($this->callbackErrorHandler)($e);
+        }
+        return true;
     }
 
     public function tick() : void{
-        if($this->timers === []){
-            return;
-        }
-        $now = ($this->clockNs)();
-        foreach($this->timers as $run => $timer){
-            if($timer['dueNs'] > $now){
-                continue;
-            }
-            unset($this->timers[$run]);
-            ($timer['run'])();
+        if($this->timers !== []){
+            $this->fire(($this->clockNs)());
         }
     }
 
@@ -154,9 +141,16 @@ final class RpcRetrier{
 
     public function stop() : void{
         $this->stopped = true;
-        $timers = $this->timers;
-        $this->timers = [];
-        foreach($timers as $timer){
+        $this->fire(PHP_INT_MAX);
+    }
+
+    private function fire(int $now) : void{
+        foreach($this->timers as $run => $timer){
+            // a callback may have cancelled this run, and a new run can reuse its key
+            if($timer['dueNs'] > $now || ($this->timers[$run] ?? null) !== $timer){
+                continue;
+            }
+            unset($this->timers[$run]);
             ($timer['run'])();
         }
     }

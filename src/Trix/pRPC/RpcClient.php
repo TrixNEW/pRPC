@@ -28,10 +28,8 @@ use Trix\pRPC\utils\exception\RpcTimeoutException;
 use Trix\pRPC\utils\exception\RpcWorkerException;
 use Vow\Deferred;
 use Vow\Promise;
+use WeakMap;
 
-/**
- * Every promise settles on the main thread, from the tick task or the sleeper notifier, never on a worker.
- */
 final class RpcClient{
     private const int PROBE_INTERVAL_NS = 50_000_000;
 
@@ -45,8 +43,11 @@ final class RpcClient{
     /** @var array<string, RpcMethod> */
     private array $methodsByPath = [];
 
-    /** @var array<int, array{Deferred<Message>, class-string<Message>, int, int, int}> id => deferred, response class, deadline, timeout ms, start */
+    /** @var array<int, array{Deferred<Message>, class-string<Message>, int, int, int}> */
     private array $pending = [];
+
+    /** @var WeakMap<Promise<Message>, int> */
+    private readonly WeakMap $ids;
 
     /** @var array<int, int> request id => queued bytes, until a worker hands the request back */
     private array $transport = [];
@@ -78,7 +79,8 @@ final class RpcClient{
         $this->callbackErrorHandler = static function(Throwable $e) : void{
             \GlobalLogger::get()->logException($e);
         };
-        $this->retrier = new RpcRetrier($this->callbackErrorHandler, static fn() : int => hrtime(true), $this->cancelCall(...));
+        $this->retrier = new RpcRetrier($this->callbackErrorHandler, static fn() : int => hrtime(true));
+        $this->ids = new WeakMap();
         $this->latency = new RpcLatency();
         $this->queueWait = new RpcLatency();
 
@@ -185,6 +187,7 @@ final class RpcClient{
         /** @var Deferred<TResponse> $deferred */
         $deferred = new Deferred();
         $this->pending[$id] = [$deferred, $method->responseClass, $deadlineNs, $timeoutMs, $now];
+        $this->ids[$deferred->promise] = $id;
         $this->transport[$id] = $jobBytes;
         $this->transportBytes += $jobBytes;
         if($deadlineNs < $this->nextDeadlineNs){
@@ -209,14 +212,13 @@ final class RpcClient{
     }
 
     /**
-     * Rejects a promise returned by call() or callRetrying() with a CancelledException and drops its result. A call
-     * already sent still runs on the server, gRPC can't interrupt it once a worker has it.
+     * Rejects a call() or callRetrying() promise with a CancelledException. A call a worker already sent still runs.
      *
      * @param Promise<mixed> $promise
      * @return bool false if the promise already settled or didn't come from this client
      */
     public function cancel(Promise $promise) : bool{
-        return $this->cancelCall($promise) || $this->retrier->cancel($promise);
+        return $this->cancelCall($promise) || $this->retrier->cancel($promise, $this->cancelCall(...));
     }
 
     /**
@@ -489,32 +491,23 @@ final class RpcClient{
         return $this->nextId++;
     }
 
-    /**
-     * Stops waiting for a call. Its transport slot stays taken until the worker hands it back.
-     *
-     * @param Promise<mixed> $promise
-     */
+    /** @param Promise<mixed> $promise */
     private function cancelCall(Promise $promise) : bool{
-        // ponytail: linear scan, cancelling is rare and this keeps call() free of a promise index
-        foreach($this->pending as $id => [$deferred]){
-            if($deferred->promise === $promise){
-                unset($this->pending[$id]);
-                try{
-                    $deferred->cancel();
-                }catch(Throwable $e){
-                    ($this->callbackErrorHandler)($e);
-                }
-                return true;
-            }
+        $id = $this->ids[$promise] ?? null;
+        $deferred = $id === null ? null : $this->pending[$id][0] ?? null;
+        if($deferred === null || $deferred->promise !== $promise){
+            return false;
         }
-        return false;
+        unset($this->pending[$id]);
+        try{
+            $deferred->cancel();
+        }catch(Throwable $e){
+            ($this->callbackErrorHandler)($e);
+        }
+        return true;
     }
 
-    /**
-     * Callbacks attached with observe() can throw out of a settle, which must not cut a result drain short.
-     *
-     * @param Deferred<Message> $deferred
-     */
+    /** @param Deferred<Message> $deferred */
     private function reject(Deferred $deferred, Throwable $error) : void{
         try{
             $deferred->reject($error);

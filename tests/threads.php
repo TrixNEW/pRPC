@@ -584,6 +584,23 @@ $tests['cancel settles once, frees the pending entry and drops the late result']
     $until(static fn() : bool => $client->outstandingCount() === 0, 5);
 };
 
+$tests['cancelling thousands of pending calls stays fast'] = static function() use ($config, $echo, $until, $check) : void{
+    $client = Open::add(new RpcClient(Bench::$plugin, $config('mode=blackhole', ['maxOutstanding' => 10_000, 'defaultTimeoutMs' => 300])));
+    $promises = [];
+    for($i = 0; $i < 4_000; ++$i){
+        $promises[] = $client->call($echo, new StringValue(['value' => 'x']));
+    }
+    $start = hrtime(true);
+    $cancelled = 0;
+    foreach(array_reverse($promises) as $promise){
+        $cancelled += $client->cancel($promise) ? 1 : 0;
+    }
+    $ms = (hrtime(true) - $start) / 1e6;
+    $check($cancelled === 4_000 && $client->pendingCount() === 0, "$cancelled cancelled");
+    $check($ms < 50, "cancelling 4000 calls took {$ms}ms");
+    $until(static fn() : bool => $client->outstandingCount() === 0, 5);
+};
+
 $tests['a throwing observer does not lose other results from the same drain'] = static function() use ($config, $echo, $until, $check) : void{
     $client = Open::add(new RpcClient(Bench::$plugin, $config('lat=20000', ['maxOutstanding' => 10_000, 'batchSize' => 16])));
     $ok = 0;
