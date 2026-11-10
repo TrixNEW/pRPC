@@ -6,7 +6,7 @@ pRPC executes gRPC calls on worker threads, keeping network operations off the m
 
 ## Features
 
-- **Asynchronous RPC** — Non-blocking unary calls using dedicated worker threads.
+- **Asynchronous RPC** — Non-blocking unary calls on dedicated worker threads, returned as [Vow](https://github.com/TrixNEW/Vow) promises.
 - **Shared worker pools** — Multiple endpoints can share workers with independent concurrency limits.
 - **Connection management** — Channel reuse, reconnection, deadlines, and graceful shutdown.
 - **Reliable execution** — Bounded queues, overload protection, failure handling, and configurable retries.
@@ -18,7 +18,7 @@ pRPC executes gRPC calls on worker threads, keeping network operations off the m
 
 - Quark 6 (plugin API `6.0.0`) on PHP 8.4+ with `pmmpthread` (Quark's binaries ship qthreads)
 - `ext-grpc` (not included in Quark's binaries)
-- `google/protobuf ^4.31 || ^5.0`
+- `google/protobuf ^4.31 || ^5.0` and `trixnew/vow ^1.0.1`
 - `ext-protobuf`, strongly recommended. Use [TrixNEW/ext-protobuf](https://github.com/TrixNEW/ext-protobuf), tested on threads. Without it a 16 KB request takes about 0.5 ms of main thread time to encode, with it about 5 µs
 
 > **Recommended:** Use [TrixNEW/ext-grpc](https://github.com/TrixNEW/ext-grpc), a patched version of ext-grpc 1.74.0 that fixes completion queue issues affecting multithreaded PHP applications.
@@ -59,19 +59,34 @@ $this->rpc = new RpcClient($this, new RpcClientConfig(
 ));
 ```
 
-Execute an asynchronous call:
+Execute an asynchronous call. `call()` returns a [Vow](https://github.com/TrixNEW/Vow) `Promise` for the response:
 
 ```php
-$this->rpc->call($getPlayer, $request)
-    ->then(function(GetPlayerResponse $response): void {
+$this->rpc->call($getPlayer, $request)->then(
+    function(GetPlayerResponse $response): void {
         // Handle response
-    })
-    ->onError(function(Throwable $error): void {
+    },
+    function(Throwable $error): void {
         // Handle failure
-    });
+    }
+);
 ```
 
-Callbacks execute on the main thread. Close the client when disabling your plugin:
+`then()` returns a new promise, so calls can be chained and a callback can return another call's promise. When nothing is chained, `observe()` takes the same two callbacks and skips that extra promise. Inside `Promise::async()` a call can be awaited:
+
+```php
+use Vow\Promise;
+
+Promise::async(function() use ($getPlayer, $request): void {
+    $player = $this->rpc->call($getPlayer, $request)->await();
+});
+```
+
+Callbacks run on the main thread, from the server tick, never on a worker. A rejection nobody handles is reported through `error_log()` unless you set a handler, for example `Promise::setRejectionHandler(fn(Throwable $e) => $this->getLogger()->logException($e))`.
+
+`$this->rpc->cancel($promise)` rejects a pending call with `Vow\CancelledException` and drops its late result. A call a worker already sent still runs on the server, since gRPC can't interrupt it.
+
+Close the client when disabling your plugin:
 
 ```php
 $this->rpc->close();
