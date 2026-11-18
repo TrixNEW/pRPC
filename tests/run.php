@@ -5,6 +5,9 @@ declare(strict_types=1);
 require dirname(__DIR__) . '/vendor/autoload.php';
 require __DIR__ . '/grpc_constants.php';
 
+// traces holding args make a rejected promise and its reason a cycle, so object ids only come back after a GC run
+ini_set('zend.exception_ignore_args', '1');
+
 use Google\Protobuf\Internal\Message;
 use Trix\pRPC\opts\RpcCallOptions;
 use Trix\pRPC\opts\RpcClientConfig;
