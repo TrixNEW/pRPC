@@ -303,6 +303,21 @@ $tests['isReady waits for the channel and stays false for a dead one'] = static 
     $manager->close();
 };
 
+$tests['closing a client that only probed a dead endpoint joins every worker at once'] = static function() use ($config, $check, $pRPCThreads) : void{
+    $threadsBefore = $pRPCThreads();
+    $client = Open::add(new RpcClient(Bench::$plugin, $config('mode=down', ['workers' => 4])));
+    $deadline = hrtime(true) + 500_000_000;
+    while(hrtime(true) < $deadline){
+        $check(!$client->isReady(), 'a dead endpoint reported ready');
+        usleep(20_000);
+    }
+    $start = hrtime(true);
+    $client->close();
+    $closeMs = (hrtime(true) - $start) / 1e6;
+    $check($closeMs < 1_000, "close took $closeMs ms");
+    $check($pRPCThreads() <= $threadsBefore, 'workers were left behind for Quark to join');
+};
+
 $tests['a worker stuck past its deadline is replaced and other endpoints keep working'] = static function() use ($config, $send, $newLog, $settled, $until, $check) : void{
     $manager = Open::add(new RpcClientManager(Bench::$plugin, workers: 2));
     $hung = $manager->register('hung', $config('mode=hang,hang=6000', ['workers' => 1, 'defaultTimeoutMs' => 300]));
