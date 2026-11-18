@@ -186,6 +186,10 @@ $tests['slow, dead and down endpoints do not slow a fast one'] = static function
         'dead' => $manager->register('dead', $config('mode=blackhole', ['defaultTimeoutMs' => 1_500])),
         'down' => $manager->register('down', $config('mode=down')),
     ];
+    // the first call pays one-off loading, which is not what this measures
+    $warm = $newLog();
+    $send($fast, 'warm-up', $warm);
+    $until(static fn() : bool => $settled($warm));
     $fastLog = $newLog();
     $badLog = $newLog();
     $tick = 0;
@@ -214,6 +218,9 @@ $tests['a flood on one endpoint is shared fairly with a quiet one'] = static fun
     $manager = Open::add(new RpcClientManager(Bench::$plugin, workers: 2));
     $flood = $manager->register('flood', $config('lat=2000', ['workers' => 2, 'batchSize' => 1, 'maxOutstanding' => 10_000]));
     $quiet = $manager->register('quiet', $config('lat=300', ['workers' => 2]));
+    $warm = $newLog();
+    $send($quiet, 'warm-up', $warm);
+    $until(static fn() : bool => $settled($warm));
     $floodLog = $newLog();
     $quietLog = $newLog();
     for($i = 0; $i < 400; ++$i){
@@ -301,6 +308,21 @@ $tests['isReady waits for the channel and stays false for a dead one'] = static 
     }
     $check($down->stats()->connectivity === 'transient_failure', 'connectivity was ' . $down->stats()->connectivity);
     $manager->close();
+};
+
+$tests['closing a client that only probed a dead endpoint joins every worker at once'] = static function() use ($config, $check, $pRPCThreads) : void{
+    $threadsBefore = $pRPCThreads();
+    $client = Open::add(new RpcClient(Bench::$plugin, $config('mode=down', ['workers' => 4])));
+    $deadline = hrtime(true) + 500_000_000;
+    while(hrtime(true) < $deadline){
+        $check(!$client->isReady(), 'a dead endpoint reported ready');
+        usleep(20_000);
+    }
+    $start = hrtime(true);
+    $client->close();
+    $closeMs = (hrtime(true) - $start) / 1e6;
+    $check($closeMs < 1_000, "close took $closeMs ms");
+    $check($pRPCThreads() <= $threadsBefore, 'workers were left behind for Quark to join');
 };
 
 $tests['a worker stuck past its deadline is replaced and other endpoints keep working'] = static function() use ($config, $send, $newLog, $settled, $until, $check) : void{
