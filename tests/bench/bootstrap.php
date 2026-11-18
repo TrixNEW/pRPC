@@ -20,6 +20,25 @@ $src = getenv('PRPC_SRC') ?: dirname(__DIR__, 2) . '/src/Trix/pRPC';
 $fake = getenv('PRPC_TRANSPORT') !== 'grpc';
 $fakeDir = getenv('PRPC_FAKE') ?: __DIR__ . '/fake/Grpc';
 
+if($fake && extension_loaded('grpc')){
+    // ext-grpc's own classes would win over the fake ones, so rerun on the same ini without it
+    if(getenv('PRPC_FAKE_REEXEC') !== false || !function_exists('pcntl_exec')){
+        fwrite(STDERR, "ext-grpc is loaded and hides the fake transport, run with an ini that leaves it out.\n");
+        exit(1);
+    }
+    $ini = '';
+    foreach(array_filter(array_map('trim', [(string) php_ini_loaded_file(), ...explode(',', (string) php_ini_scanned_files())])) as $file){
+        $ini .= "[PHP]\n" . preg_replace('/^\s*extension\s*=\s*"?(php_)?grpc(\.so|\.dll)?"?\s*$/mi', '', (string) file_get_contents($file)) . "\n";
+    }
+    $iniFile = sys_get_temp_dir() . '/prpc-fake-' . md5($ini) . '.ini';
+    file_put_contents($iniFile, $ini);
+    putenv('PRPC_FAKE_REEXEC=1');
+    putenv('PHP_INI_SCAN_DIR=');
+    pcntl_exec(PHP_BINARY, ['-c', $iniFile, ...$_SERVER['argv']]);
+    fwrite(STDERR, "Could not rerun PHP without ext-grpc.\n");
+    exit(1);
+}
+
 if(!is_file($pm . '/vendor/autoload.php')){
     fwrite(STDERR, "Set PRPC_PM to a Quark checkout with composer dependencies installed.\n");
     exit(1);
