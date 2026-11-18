@@ -138,6 +138,10 @@ final class GrpcWorkerThread extends Thread{
         $backoff = [];
         $epoch = -1;
         $normalExit = false;
+        // each thread autoloads on its own, so load the call path now instead of during a worker's first call
+        foreach([Call::class, Channel::class, ChannelCredentials::class, Timeval::class, GrpcGate::class, RpcStatus::class] as $class){
+            class_exists($class);
+        }
         $this->setState(self::STATE_READY);
 
         try{
