@@ -186,6 +186,10 @@ $tests['slow, dead and down endpoints do not slow a fast one'] = static function
         'dead' => $manager->register('dead', $config('mode=blackhole', ['defaultTimeoutMs' => 1_500])),
         'down' => $manager->register('down', $config('mode=down')),
     ];
+    // the first call pays one-off loading, which is not what this measures
+    $warm = $newLog();
+    $send($fast, 'warm-up', $warm);
+    $until(static fn() : bool => $settled($warm));
     $fastLog = $newLog();
     $badLog = $newLog();
     $tick = 0;
@@ -214,6 +218,9 @@ $tests['a flood on one endpoint is shared fairly with a quiet one'] = static fun
     $manager = Open::add(new RpcClientManager(Bench::$plugin, workers: 2));
     $flood = $manager->register('flood', $config('lat=2000', ['workers' => 2, 'batchSize' => 1, 'maxOutstanding' => 10_000]));
     $quiet = $manager->register('quiet', $config('lat=300', ['workers' => 2]));
+    $warm = $newLog();
+    $send($quiet, 'warm-up', $warm);
+    $until(static fn() : bool => $settled($warm));
     $floodLog = $newLog();
     $quietLog = $newLog();
     for($i = 0; $i < 400; ++$i){
