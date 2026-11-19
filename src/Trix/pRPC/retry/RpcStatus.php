@@ -38,7 +38,9 @@ final class RpcStatus{
     }
 
     public static function notSent(Throwable $e) : bool{
-        return $e instanceof RpcOverloadedException || $e instanceof RpcMessageTooLargeException || ($e instanceof RpcWorkerException && !$e->sent);
+        return $e instanceof RpcOverloadedException
+            || ($e instanceof RpcMessageTooLargeException && $e->direction !== 'response')
+            || ($e instanceof RpcWorkerException && !$e->sent);
     }
 
     public static function isAmbiguous(Throwable $e) : bool{
@@ -49,7 +51,8 @@ final class RpcStatus{
             return true;
         }
         return match(self::code($e)){
-            self::DEADLINE_EXCEEDED, self::UNAVAILABLE, self::UNKNOWN, self::INTERNAL, self::CANCELLED => true,
+            self::DEADLINE_EXCEEDED, self::UNAVAILABLE, self::UNKNOWN, self::INTERNAL, self::CANCELLED,
+            self::RESOURCE_EXHAUSTED, self::DATA_LOSS => true,
             default => false,
         };
     }

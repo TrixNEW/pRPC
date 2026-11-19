@@ -12,6 +12,7 @@ use pmmp\thread\Thread as NativeThread;
 use quark\thread\ThreadManager;
 use Trix\pRPC\opts\RpcClientConfig;
 use Trix\pRPC\opts\RpcCredentials;
+use Trix\pRPC\retry\RpcRetryPolicy;
 use Trix\pRPC\RpcClient;
 use Trix\pRPC\RpcClientManager;
 use Trix\pRPC\RpcMethod;
@@ -604,6 +605,17 @@ $tests['cancel settles once, frees the pending entry and drops the late result']
     $check($client->cancel($retrying) && $retrying->reason() instanceof CancelledException, 'retrying call was not cancelled');
     $check($client->pendingCount() === 0, 'the attempt in flight was left pending');
     $until(static fn() : bool => $client->outstandingCount() === 0, 5);
+};
+
+$tests['retry sends the original bytes after the caller changes its request'] = static function() use ($config, $echo, $until, $check) : void{
+    $client = Open::add(new RpcClient(Bench::$plugin, $config('lat=500', ['maxOutstanding' => 1])));
+    $first = $client->call($echo, new StringValue(['value' => 'occupy the queue']));
+    $request = new StringValue(['value' => 'original']);
+    $retry = $client->callRetrying($echo, $request, new RpcRetryPolicy(baseDelayMs: 50, jitter: 0.0));
+    $check($retry->isPending() && $client->stats()->retrying === 1, 'retry did not wait for room');
+    $request->setValue('changed');
+    $until(static fn() : bool => !$first->isPending() && !$retry->isPending());
+    $check($retry->value()->getValue() === 'original', 'retry reserialized the changed request');
 };
 
 $tests['cancelling thousands of pending calls stays fast'] = static function() use ($config, $echo, $until, $check) : void{

@@ -84,12 +84,14 @@ $test('failures are classified by whether a retry is safe', static function() : 
     $cases = [
         [new RpcOverloadedException(10), true, false],
         [new RpcMessageTooLargeException('request', 10, 5), false, false],
+        [new RpcMessageTooLargeException('response', 10, 5), false, true],
         [new RpcTimeoutException(100), true, true],
         [new RpcClosedException(), false, true],
         [new RpcWorkerException('lost mid call'), true, true],
         [new RpcWorkerException('never queued', sent: false), true, false],
         [new RpcException('down', RpcStatus::UNAVAILABLE), true, true],
-        [new RpcException('busy', RpcStatus::RESOURCE_EXHAUSTED), true, false],
+        [new RpcException('busy', RpcStatus::RESOURCE_EXHAUSTED), true, true],
+        [new RpcException('bad response', RpcStatus::DATA_LOSS), false, true],
         [new RpcException('rule', RpcStatus::FAILED_PRECONDITION), false, false],
         [new RpcException('bad', RpcStatus::INVALID_ARGUMENT), false, false],
         [new RuntimeException('other'), false, true],
@@ -231,15 +233,77 @@ $test('retrier gives ambiguous final codes a few tries and never retries a close
     }
 });
 
-$test('stopping the retrier runs waiting retries immediately', static function() use ($retrier, $attempts) : void{
+$test('stopping the retrier rejects waiting retries without sending', static function() use ($retrier, $attempts) : void{
     [$r] = $retrier();
     $calls = 0;
     $error = null;
     $r->run($attempts([new RpcOverloadedException(1), new RpcClosedException()], $calls), new RpcRetryPolicy(baseDelayMs: 1_000, maxDelayMs: 1_000))
         ->catch(static function(Throwable $e) use (&$error) : void{ $error = $e; });
     $r->stop();
-    if($calls !== 2 || !$error instanceof RpcClosedException || $r->waiting() !== 0){
+    if($calls !== 1 || !$error instanceof RpcClosedException || $r->waiting() !== 0){
         throw new RuntimeException('Stop did not settle waiting retries.');
+    }
+});
+
+$test('a late timer does not send after the retry budget expires', static function() use ($retrier, $attempts) : void{
+    [$r, $advance] = $retrier();
+    $calls = 0;
+    $failure = new RpcTimeoutException(1);
+    $policy = new RpcRetryPolicy(baseDelayMs: 10, retryAmbiguous: true, jitter: 0.0, totalTimeoutMs: 20);
+    $promise = $r->run($attempts([$failure, 'unexpected'], $calls), $policy);
+    $advance(21);
+    if($calls !== 1 || $promise->reason() !== $failure || $r->waiting() !== 0){
+        throw new RuntimeException('A retry escaped its deadline or lost its failure.');
+    }
+});
+
+$test('a late definitive failure cannot erase an earlier uncertain outcome', static function() use ($retrier, $attempts) : void{
+    [$r, $advance] = $retrier();
+    $calls = 0;
+    $timeout = new RpcTimeoutException(1);
+    $policy = new RpcRetryPolicy(maxAttempts: 2, baseDelayMs: 10, retryAmbiguous: true, jitter: 0.0);
+    $promise = $r->run($attempts([$timeout, new RpcOverloadedException(1)], $calls), $policy);
+    $advance(10);
+    if($calls !== 2 || $promise->reason() !== $timeout){
+        throw new RuntimeException('An earlier possibly committed attempt was lost.');
+    }
+});
+
+$test('a retry callback can cancel the run without leaving a timer', static function() use ($retrier, $attempts) : void{
+    [$r, $advance, , , $cancelAttempt] = $retrier();
+    $calls = 0;
+    $promise = null;
+    $deferreds = new ArrayObject();
+    $promise = $r->run($attempts([null, 'unexpected'], $calls, $deferreds), new RpcRetryPolicy(),
+        static function() use ($r, &$promise, $cancelAttempt) : void{ $r->cancel($promise, $cancelAttempt); });
+    $deferreds[0]->reject(new RpcOverloadedException(1));
+    $advance(1_000);
+    if($calls !== 1 || !$promise->reason() instanceof CancelledException || $r->waiting() !== 0){
+        throw new RuntimeException('A retry was left behind by cancellation from its hook.');
+    }
+});
+
+$test('waiting retries respect request and byte limits and release their budget', static function() use ($attempts) : void{
+    $r = new RpcRetrier(static fn(Throwable $e) => throw $e, static fn() : int => 0, 2, 10);
+    $calls = 0;
+    $policy = new RpcRetryPolicy();
+    $pending = $attempts([new RpcOverloadedException(1)], $calls);
+    $ok = $attempts(['ok', 'ok'], $calls);
+    $first = $r->run($pending, $policy, bytes: 8);
+    if(!$r->run($ok, $policy, bytes: 3)->reason() instanceof RpcOverloadedException || $calls !== 1){
+        throw new RuntimeException('Waiting retry bytes did not count toward backpressure.');
+    }
+    $other = $r->run($attempts([new RpcOverloadedException(1)], $calls), $policy, bytes: 2);
+    if(!$r->run($ok, $policy)->reason() instanceof RpcOverloadedException || $calls !== 2){
+        throw new RuntimeException('Waiting retry did not count toward backpressure.');
+    }
+    $r->cancel($first, static fn() : bool => false);
+    if($r->run($ok, $policy, bytes: 8)->value() !== 'ok' || $r->run($ok, $policy, bytes: 8)->value() !== 'ok'){
+        throw new RuntimeException('Retry backpressure budget was not freed.');
+    }
+    $r->stop();
+    if(!$other->reason() instanceof RpcClosedException){
+        throw new RuntimeException('Budget test left a pending run.');
     }
 });
 

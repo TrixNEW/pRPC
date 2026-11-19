@@ -7,16 +7,19 @@ namespace Trix\pRPC\retry;
 use Closure;
 use Throwable;
 use Trix\pRPC\utils\exception\RpcClosedException;
+use Trix\pRPC\utils\exception\RpcMessageTooLargeException;
+use Trix\pRPC\utils\exception\RpcOverloadedException;
 use Vow\Deferred;
 use Vow\Promise;
 
 /** @internal */
 final class RpcRetrier{
-    /** @var array<int, array{Deferred<mixed>, ?Promise<mixed>}> */
+    /** @var array<int, array{Deferred<mixed>, ?Promise<mixed>, int}> */
     private array $runs = [];
     /** @var array<int, array{dueNs: int, run: Closure(): void}> */
     private array $timers = [];
     private int $retries = 0;
+    private int $pendingBytes = 0;
     private bool $stopped = false;
 
     /**
@@ -25,7 +28,9 @@ final class RpcRetrier{
      */
     public function __construct(
         private readonly Closure $callbackErrorHandler,
-        private readonly Closure $clockNs
+        private readonly Closure $clockNs,
+        private readonly int $maxOutstanding = PHP_INT_MAX,
+        private readonly int $maxQueuedBytes = PHP_INT_MAX
     ){}
 
     /**
@@ -34,34 +39,45 @@ final class RpcRetrier{
      * @param ?Closure(Throwable, int): void $onRetry
      * @return Promise<T>
      */
-    public function run(Closure $attempt, RpcRetryPolicy $policy, ?Closure $onRetry = null) : Promise{
+    public function run(Closure $attempt, RpcRetryPolicy $policy, ?Closure $onRetry = null, int $bytes = 0) : Promise{
+        if($this->stopped){
+            return Promise::rejected(new RpcClosedException());
+        }
+        if(count($this->runs) >= $this->maxOutstanding){
+            return Promise::rejected(new RpcOverloadedException($this->maxOutstanding));
+        }
+        if($this->runs !== [] && $bytes > $this->maxQueuedBytes - $this->pendingBytes){
+            return Promise::rejected(new RpcOverloadedException($this->maxQueuedBytes, 'byte'));
+        }
         /** @var Deferred<T> $deferred */
         $deferred = new Deferred();
         $run = spl_object_id($deferred->promise);
-        $this->runs[$run] = [$deferred, null];
+        $this->runs[$run] = [$deferred, null, $bytes];
+        $this->pendingBytes += $bytes;
         $giveUpNs = $policy->totalTimeoutMs === null ? PHP_INT_MAX : ($this->clockNs)() + $policy->totalTimeoutMs * 1_000_000;
-        $this->attempt($run, $attempt, $policy, $onRetry, 1, 0, $giveUpNs);
+        $this->attempt($run, $attempt, $policy, $onRetry, 1, 0, $giveUpNs, null);
         return $deferred->promise;
     }
 
-    private function attempt(int $run, Closure $attempt, RpcRetryPolicy $policy, ?Closure $onRetry, int $n, int $uncertain, int $giveUpNs) : void{
+    private function attempt(int $run, Closure $attempt, RpcRetryPolicy $policy, ?Closure $onRetry, int $n, int $uncertain, int $giveUpNs, ?Throwable $previousAmbiguous) : void{
         try{
             $promise = $attempt();
         }catch(Throwable $e){
-            $this->finish($run, false, $e);
+            $this->finish($run, false, $previousAmbiguous ?? $e);
             return;
         }
         $this->runs[$run][1] = $promise;
         $promise->observe(
             fn(mixed $value) => $this->finish($run, true, $value),
-            function(Throwable $e) use ($run, $attempt, $policy, $onRetry, $n, $uncertain, $giveUpNs) : void{
+            function(Throwable $e) use ($run, $attempt, $policy, $onRetry, $n, $uncertain, $giveUpNs, $previousAmbiguous) : void{
                 if(!isset($this->runs[$run])){
                     return;
                 }
                 $this->runs[$run][1] = null;
                 $ambiguous = RpcStatus::isAmbiguous($e);
+                $lastAmbiguous = $ambiguous ? $e : $previousAmbiguous;
                 // usually final, so these only get a few extra tries
-                $uncertainRetry = $ambiguous && !RpcStatus::isRetryable($e) && !$e instanceof RpcClosedException;
+                $uncertainRetry = $ambiguous && !RpcStatus::isRetryable($e) && !$e instanceof RpcClosedException && !$e instanceof RpcMessageTooLargeException;
                 if($uncertainRetry){
                     ++$uncertain;
                 }
@@ -71,10 +87,20 @@ final class RpcRetrier{
                     && ($uncertainRetry ? $uncertain < $policy->maxUncertainAttempts : RpcStatus::isRetryable($e));
                 $dueNs = $retry ? ($this->clockNs)() + $policy->delayMs($n) * 1_000_000 : 0;
                 if(!$retry || $dueNs > $giveUpNs){
-                    $this->finish($run, false, $e);
+                    $this->finish($run, false, $lastAmbiguous ?? $e);
                     return;
                 }
                 ++$this->retries;
+                $this->timers[$run] = [
+                    'dueNs' => $dueNs,
+                    'run' => function() use ($run, $attempt, $policy, $onRetry, $n, $uncertain, $giveUpNs, $lastAmbiguous, $e) : void{
+                        if(($this->clockNs)() > $giveUpNs){
+                            $this->finish($run, false, $lastAmbiguous ?? $e);
+                            return;
+                        }
+                        $this->attempt($run, $attempt, $policy, $onRetry, $n + 1, $uncertain, $giveUpNs, $lastAmbiguous);
+                    },
+                ];
                 if($onRetry !== null){
                     try{
                         $onRetry($e, $n);
@@ -82,20 +108,18 @@ final class RpcRetrier{
                         ($this->callbackErrorHandler)($hookError);
                     }
                 }
-                $this->timers[$run] = [
-                    'dueNs' => $dueNs,
-                    'run' => fn() => $this->attempt($run, $attempt, $policy, $onRetry, $n + 1, $uncertain, $giveUpNs),
-                ];
             }
         );
     }
 
     private function finish(int $run, bool $fulfilled, mixed $result) : void{
-        $deferred = $this->runs[$run][0] ?? null;
-        if($deferred === null){
+        $state = $this->runs[$run] ?? null;
+        if($state === null){
             return;
         }
+        [$deferred, , $bytes] = $state;
         unset($this->runs[$run]);
+        $this->pendingBytes -= $bytes;
         try{
             $fulfilled ? $deferred->resolve($result) : $deferred->reject($result);
         }catch(Throwable $e){
@@ -112,8 +136,9 @@ final class RpcRetrier{
         if(!isset($this->runs[$run])){
             return false;
         }
-        [$deferred, $inFlight] = $this->runs[$run];
+        [$deferred, $inFlight, $bytes] = $this->runs[$run];
         unset($this->runs[$run], $this->timers[$run]);
+        $this->pendingBytes -= $bytes;
         if($inFlight !== null){
             $cancelAttempt($inFlight);
         }
@@ -141,7 +166,11 @@ final class RpcRetrier{
 
     public function stop() : void{
         $this->stopped = true;
-        $this->fire(PHP_INT_MAX);
+        $error = new RpcClosedException();
+        foreach($this->timers as $run => $_){
+            unset($this->timers[$run]);
+            $this->finish($run, false, $error);
+        }
     }
 
     private function fire(int $now) : void{

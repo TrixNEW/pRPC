@@ -79,7 +79,7 @@ final class RpcClient{
         $this->callbackErrorHandler = static function(Throwable $e) : void{
             \GlobalLogger::get()->logException($e);
         };
-        $this->retrier = new RpcRetrier($this->callbackErrorHandler, static fn() : int => hrtime(true));
+        $this->retrier = new RpcRetrier($this->callbackErrorHandler, static fn() : int => hrtime(true), $config->maxOutstanding, $config->maxQueuedBytes);
         $this->ids = new WeakMap();
         $this->latency = new RpcLatency();
         $this->queueWait = new RpcLatency();
@@ -129,7 +129,11 @@ final class RpcClient{
         if($this->closed){
             return Promise::rejected(new RpcClosedException());
         }
+        $this->validateRequest($method, $request);
+        return $this->submit($method, $request, $options ?? RpcCallOptions::none());
+    }
 
+    private function validateRequest(RpcMethod $method, Message $request) : void{
         $registered = $this->methodsByPath[$method->path] ?? null;
         if($registered === null || $registered->requestClass !== $method->requestClass || $registered->responseClass !== $method->responseClass){
             throw new InvalidArgumentException("RPC method '$method->path' is not registered in this client.");
@@ -137,12 +141,17 @@ final class RpcClient{
         if(!$request instanceof $method->requestClass){
             throw new InvalidArgumentException("RPC '$method->path' expects $method->requestClass, got " . $request::class . '.');
         }
+    }
+
+    private function submit(RpcMethod $method, Message|string $request, RpcCallOptions $options) : Promise{
+        if($this->closed){
+            return Promise::rejected(new RpcClosedException());
+        }
         if(count($this->transport) >= $this->config->maxOutstanding){
             ++$this->overloaded;
             return Promise::rejected(new RpcOverloadedException($this->config->maxOutstanding));
         }
 
-        $options ??= RpcCallOptions::none();
         $timeoutMs = $options->timeoutMs ?? $this->config->defaultTimeoutMs;
         if($timeoutMs > $this->config->maxTimeoutMs){
             throw new InvalidArgumentException("timeoutMs cannot exceed {$this->config->maxTimeoutMs} ms.");
@@ -156,7 +165,7 @@ final class RpcClient{
         }
 
         try{
-            $requestData = $request->serializeToString();
+            $requestData = is_string($request) ? $request : $request->serializeToString();
         }catch(Throwable $e){
             return Promise::rejected(new RpcException('Request serialization failed: ' . $e->getMessage(), RpcStatus::INTERNAL));
         }
@@ -208,7 +217,34 @@ final class RpcClient{
      * @return Promise<TResponse>
      */
     public function callRetrying(RpcMethod $method, Message $request, ?RpcRetryPolicy $policy = null, ?RpcCallOptions $options = null, ?Closure $onRetry = null) : Promise{
-        return $this->retrier->run(fn() : Promise => $this->call($method, $request, $options), $policy ?? new RpcRetryPolicy(), $onRetry);
+        if($this->closed){
+            return Promise::rejected(new RpcClosedException());
+        }
+        try{
+            $this->validateRequest($method, $request);
+        }catch(InvalidArgumentException $e){
+            return Promise::rejected($e);
+        }
+        try{
+            $requestData = $request->serializeToString();
+        }catch(Throwable $e){
+            return Promise::rejected(new RpcException('Request serialization failed: ' . $e->getMessage(), RpcStatus::INTERNAL));
+        }
+        $requestBytes = strlen($requestData);
+        if($requestBytes > $this->config->maxRequestBytes){
+            return Promise::rejected(new RpcMessageTooLargeException('request', $requestBytes, $this->config->maxRequestBytes));
+        }
+        $options ??= RpcCallOptions::none();
+        $metadataBytes = $options->metadataBytes();
+        if($metadataBytes > $this->config->maxMetadataBytes){
+            return Promise::rejected(new RpcMessageTooLargeException('metadata', $metadataBytes, $this->config->maxMetadataBytes));
+        }
+        return $this->retrier->run(
+            fn() : Promise => $this->submit($method, $requestData, $options),
+            $policy ?? new RpcRetryPolicy(),
+            $onRetry,
+            $requestBytes + strlen($options->packedMetadata) + GrpcWorkerThread::JOB_HEADER_BYTES
+        );
     }
 
     /**
