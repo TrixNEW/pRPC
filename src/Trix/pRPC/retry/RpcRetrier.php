@@ -151,7 +151,7 @@ final class RpcRetrier{
     }
 
     public function tick() : void{
-        if($this->timers !== []){
+        if(!$this->stopped && $this->timers !== []){
             $this->fire(($this->clockNs)());
         }
     }

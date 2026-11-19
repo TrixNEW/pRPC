@@ -234,13 +234,14 @@ $test('retrier gives ambiguous final codes a few tries and never retries a close
 });
 
 $test('stopping the retrier rejects waiting retries without sending', static function() use ($retrier, $attempts) : void{
-    [$r] = $retrier();
+    [$r, $advance] = $retrier();
     $calls = 0;
-    $error = null;
-    $r->run($attempts([new RpcOverloadedException(1), new RpcClosedException()], $calls), new RpcRetryPolicy(baseDelayMs: 1_000, maxDelayMs: 1_000))
-        ->catch(static function(Throwable $e) use (&$error) : void{ $error = $e; });
+    $policy = new RpcRetryPolicy(baseDelayMs: 1_000, maxDelayMs: 1_000);
+    $first = $r->run($attempts([new RpcOverloadedException(1), 'unexpected'], $calls), $policy);
+    $second = $r->run($attempts([new RpcOverloadedException(1), 'unexpected'], $calls), $policy);
+    $first->catch(static fn() => $advance(2_000));
     $r->stop();
-    if($calls !== 1 || !$error instanceof RpcClosedException || $r->waiting() !== 0){
+    if($calls !== 2 || !$first->reason() instanceof RpcClosedException || !$second->reason() instanceof RpcClosedException || $r->waiting() !== 0){
         throw new RuntimeException('Stop did not settle waiting retries.');
     }
 });
